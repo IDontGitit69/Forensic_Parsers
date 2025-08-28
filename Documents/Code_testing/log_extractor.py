@@ -373,7 +373,7 @@ def save_log_entries_to_csv(log_entries, output_file_path):
 
     # Ensure the directory exists
     output_dir = os.path.dirname(output_file_path)
-    if output_dir: # Check if output_dir is not an empty string (i.e., not current directory)
+    if output_dir and not os.path.exists(output_dir): # Check if output_dir is not an empty string and if it doesn't exist
         os.makedirs(output_dir, exist_ok=True)
 
     # Write the data to the CSV file
@@ -402,7 +402,7 @@ if __name__ == "__main__":
     # 2. Find all files (potential log files) recursively in the specified directory
     log_files = []
     # Walk through the directory and its subdirectories
-    for root, _, files in os.walk(directory_path):
+    for root, _, files in tqdm(os.walk(directory_path), desc="Finding log files", unit="directory"): # Add tqdm here
         for file in files:
             file_path = os.path.join(root, file)
             # Check if the path is actually a file (and not a directory or symlink)
