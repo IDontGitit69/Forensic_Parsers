@@ -19,12 +19,7 @@ from typing import Optional, Tuple
 from tqdm import tqdm # Import tqdm for progress bars
 
 def get_user_input():
-    """
-    Gets directory path and date range for filtering from the user with validation.
-
-    Returns:
-        Tuple[str, str, str]: (directory_path, start_date_str, end_date_str)
-    """
+    """Gets directory path, date range, and output filenames from the user with validation."""
     while True:
         directory_path = input("Enter the directory path to search: ")
         if directory_path:
@@ -46,15 +41,26 @@ def get_user_input():
         else:
             print("End date cannot be empty. Please try again.")
 
-    return directory_path, start_date_str, end_date_str
+    while True:
+        unfiltered_output_filename = input("Enter the desired filename for unfiltered output (e.g., unfiltered_logs.csv): ")
+        if unfiltered_output_filename:
+            break
+        else:
+            print("Output filename cannot be empty. Please try again.")
+
+    while True:
+        filtered_output_filename = input("Enter the desired filename for filtered output (e.g., filtered_logs.csv): ")
+        if filtered_output_filename:
+            break
+        else:
+            print("Output filename cannot be empty. Please try again.")
+
+
+    return directory_path, start_date_str, end_date_str, unfiltered_output_filename, filtered_output_filename
 
 class LogTimestampParser:
-    """
-    A class to handle parsing of various timestamp formats from log lines.
-    """
     def __init__(self):
         # Define timestamp patterns and assign a type name to each
-        # The order of patterns matters; more specific patterns should be checked first.
         self.timestamp_patterns = [
             # Specific format like "Wed, 05 Mar 2025 13:11:04 +0000"
             (re.compile(r'([A-Za-z]{3}, \d{2} [A-Za-z]{3} \d{4} \d{2}:\d{2}:\d{2} [+-]\d{4})'), 'RFC 1123/822'),
@@ -87,17 +93,8 @@ class LogTimestampParser:
 
     def extract_timestamp_from_line(self, line: str) -> Tuple[Optional[str], str, int, Optional[str]]:
         """
-        Extract timestamp string and its type from log line using regex patterns.
-
-        Args:
-            line: The log line string.
-
-        Returns:
-            Tuple containing:
-            - Optional[str]: The extracted timestamp string, or None if not found.
-            - str: The remaining log message after removing the timestamp.
-            - int: The starting position of the timestamp in the original line, or -1.
-            - Optional[str]: The identified type of the timestamp pattern, or None.
+        Extract timestamp string and its type from log line
+        Returns: (timestamp_string, remaining_message, start_position, timestamp_type)
         """
         line = line.strip()
 
@@ -121,6 +118,7 @@ class LogTimestampParser:
                     after = line[end_pos:].strip()
                     message = f"{before} {after}".strip()
 
+
                 return timestamp_str, message, start_pos, pattern_type
 
         # No timestamp found
@@ -128,14 +126,7 @@ class LogTimestampParser:
 
     def parse_timestamp_string(self, timestamp_str: str, timestamp_type: Optional[str]) -> Optional[datetime]:
         """
-        Parse a timestamp string to datetime object based on identified type.
-
-        Args:
-            timestamp_str: The timestamp string to parse.
-            timestamp_type: The identified type of the timestamp pattern.
-
-        Returns:
-            Optional[datetime]: The parsed datetime object, or None if parsing fails.
+        Parse a timestamp string to datetime object based on identified type
         """
         if not timestamp_str:
             return None
@@ -155,12 +146,10 @@ class LogTimestampParser:
                     return parsed
 
             elif timestamp_type == 'ISO 8601':
-                # Use isoparse for better handling of ISO 8601 variants
                 return parser.isoparse(timestamp_str)
 
             elif timestamp_type == 'Unix Timestamp':
                  try:
-                    # Convert Unix timestamp (seconds since epoch) to datetime
                     return datetime.fromtimestamp(float(timestamp_str), tz=tzlocal())
                  except (ValueError, OverflowError):
                     return None # Handle potential errors in unix timestamp conversion
@@ -191,40 +180,27 @@ class LogTimestampParser:
 
 
             # For other types or if type-specific parsing fails, try general parsing
-            # dateutil.parser.parse is quite robust and can handle many formats
             parsed = parser.parse(timestamp_str, fuzzy=True)
             if parsed.tzinfo is None:
-                # Assume local timezone if no timezone info is present
                 parsed = parsed.replace(tzinfo=tzlocal())
             return parsed
 
         except (ValueError, TypeError, OverflowError):
-            # Catch potential errors during parsing
             return None # Return None if parsing fails
 
 
     def parse_log_line(self, line: str) -> Tuple[Optional[datetime], str, Optional[str]]:
         """
-        Parse a single log line to extract timestamp, original line, and timestamp type.
-
-        Args:
-            line: The log line string.
-
-        Returns:
-            Tuple containing:
-            - Optional[datetime]: The parsed datetime object, or None.
-            - str: The original log line (stripped).
-            - Optional[str]: The identified timestamp type, or None.
+        Parse a single log line to extract timestamp, message, and timestamp type
+        Returns: (datetime_object, original_line, timestamp_type)
         """
         timestamp_str, message, _, timestamp_type = self.extract_timestamp_from_line(line)
 
         if timestamp_str:
             timestamp = self.parse_timestamp_string(timestamp_str, timestamp_type)
-            # Return the parsed timestamp (datetime object), the original line, and the timestamp type
-            return timestamp, line.strip(), timestamp_type
+            return timestamp, line.strip(), timestamp_type # Return original line and type
         else:
-            # No timestamp found or parsing failed during extraction
-            return None, line.strip(), None # Return None for timestamp and type, and the original line
+            return None, line.strip(), None # Return original line and None type
 
 
 def parse_log_entries(all_log_entries, verbose=False):
@@ -233,11 +209,11 @@ def parse_log_entries(all_log_entries, verbose=False):
     including identifying the timestamp type and if it was converted.
 
     Args:
-        all_log_entries: List of (file_path, line) tuples.
-        verbose: If True, print detailed parsing output.
+        all_log_entries: List of (file_path, line) tuples
+        verbose: Print debugging information
 
     Returns:
-        List of (file_path, iso_timestamp_string, original_log_line, timestamp_type, was_converted) tuples.
+        List of (file_path, iso_timestamp_string, original_log_line, timestamp_type, was_converted) tuples
     """
     parser_instance = LogTimestampParser()
     parsed_log_entries = []
@@ -250,34 +226,28 @@ def parse_log_entries(all_log_entries, verbose=False):
         timestamp, original_line, timestamp_type = parser_instance.parse_log_line(line) # Get original line and type
 
         was_converted = False
-        # Check if a timestamp was found and if its original type was not ISO 8601
         if timestamp_type and timestamp_type != 'ISO 8601':
             was_converted = True
 
         if timestamp:
-            # Convert datetime object to ISO 8601 format with microsecond precision and timezone offset
+            # Convert to ISO 8601 format with microsecond precision
             iso_timestamp = timestamp.strftime('%Y-%m-%dT%H:%M:%S.%f%z')
             # Ensure timezone offset is correctly formatted (e.g., +00:00 instead of +0000)
-            # This handles cases where strftime might output +0000
             if iso_timestamp.endswith('00') and (iso_timestamp[-5] == '+' or iso_timestamp[-5] == '-'):
                  iso_timestamp = iso_timestamp[:-2] + ':' + iso_timestamp[-2:]
 
-            # Store the parsed information including the original line, timestamp type, and conversion status
-            parsed_log_entries.append((file_path, iso_timestamp, original_line, timestamp_type, was_converted))
+            parsed_log_entries.append((file_path, iso_timestamp, original_line, timestamp_type, was_converted)) # Store original line, type, and converted status
             successful_parses += 1
 
             if verbose:
                 conversion_status = "Converted" if was_converted else "Original ISO 8601"
-                # Print truncated line for readability in verbose mode
                 print(f"✓ Parsed ({timestamp_type}, {conversion_status}): {line[:50]}... -> {iso_timestamp}")
         else:
             # No timestamp found or couldn't parse
-            # Store the original line and mark timestamp as None, type as None, and not converted
-            parsed_log_entries.append((file_path, None, original_line, None, False))
+            parsed_log_entries.append((file_path, None, original_line, None, False)) # Store original line, None type, and False converted status
             failed_parses += 1
 
             if verbose:
-                # Print truncated line for readability in verbose mode
                 print(f"✗ Failed: {line[:50]}...")
 
     print(f"\nParsing Summary:")
@@ -297,10 +267,9 @@ def filter_log_entries_by_date(parsed_log_entries, start_date_str, end_date_str)
         end_date_str: End date string (YYYY-MM-DD).
 
     Returns:
-        List of filtered log entries. Returns the original list if date parsing fails.
+        List of filtered log entries.
     """
     try:
-        # Parse start and end dates and set time to beginning/end of the day for inclusive filtering
         start_date = parser.parse(start_date_str).replace(hour=0, minute=0, second=0, microsecond=0)
         end_date = parser.parse(end_date_str).replace(hour=23, minute=59, second=59, microsecond=999999)
         date_filter_valid = True
@@ -313,33 +282,34 @@ def filter_log_entries_by_date(parsed_log_entries, start_date_str, end_date_str)
         return parsed_log_entries
 
     filtered_log_entries = []
-    # Wrap the loop with tqdm for a progress bar
-    for entry in tqdm(parsed_log_entries, desc="Filtering log entries", unit="entry"):
+    for entry in tqdm(parsed_log_entries, desc="Filtering log entries", unit="entry"): # Wrap the loop with tqdm
         file_path, iso_timestamp, original_line, timestamp_type, was_converted = entry
         if iso_timestamp:
             try:
                 # Convert the ISO 8601 timestamp string back to a datetime object for comparison
                 entry_timestamp = parser.isoparse(iso_timestamp)
 
-                # To compare naive datetimes, we remove timezone info temporarily.
-                # This assumes all timestamps should be treated within the same local context
-                # for filtering purposes. Be cautious with mixed timezone logs.
-                if start_date <= entry_timestamp.replace(tzinfo=None) <= end_date.replace(tzinfo=None):
+                # Ensure timezone awareness for comparison if needed (assuming timestamps are timezone aware)
+                # If timestamps from logs might be naive, a more robust approach might be needed
+                # For now, comparing timezone-aware datetimes directly is generally safe
+
+                if start_date <= entry_timestamp.replace(tzinfo=None) <= end_date.replace(tzinfo=None): # Compare naive datetimes
                     filtered_log_entries.append(entry)
             except (ValueError, TypeError):
                 # Handle cases where the ISO timestamp string itself is invalid after parsing
                 print(f"Warning: Could not parse ISO timestamp for filtering: {iso_timestamp}. Skipping entry.")
                 pass
         else:
-            # Entries with no timestamp are excluded from date filtering.
+            # Include entries without timestamps if you want them in the output regardless of date,
+            # or exclude them if date filtering is essential.
+            # Currently, they are excluded by the if iso_timestamp check.
             pass # Skip entries with no timestamp
 
     return filtered_log_entries
 
 def sort_log_entries_by_timestamp(log_entries):
     """
-    Sorts log entries by their ISO 8601 timestamps. Entries without timestamps
-    are placed at the beginning.
+    Sorts log entries by their ISO 8601 timestamps.
 
     Args:
         log_entries: List of (file_path, iso_timestamp_string, original_log_line, timestamp_type, was_converted) tuples.
@@ -347,9 +317,9 @@ def sort_log_entries_by_timestamp(log_entries):
     Returns:
         List of sorted log entries.
     """
-    # Sort the log entries by timestamp (the second element in the tuple)
-    # If a timestamp is None, use datetime.min with local timezone to ensure it's placed first.
-    # parser.isoparse is used to convert the ISO 8601 string to a datetime object for sorting.
+    # Sort the log entries by timestamp
+    # The timestamp is the second element (index 1) in each tuple
+    # Use datetime.min with local timezone for entries with None timestamp to place them at the beginning
     return sorted(log_entries, key=lambda x: parser.isoparse(x[1]) if x[1] else datetime.min.replace(tzinfo=tzlocal()))
 
 def save_log_entries_to_csv(log_entries, output_file_path):
@@ -360,10 +330,9 @@ def save_log_entries_to_csv(log_entries, output_file_path):
         log_entries: List of (file_path, iso_timestamp_string, original_log_line, timestamp_type, was_converted) tuples.
         output_file_path: Path to the output CSV file.
     """
-    # Define the CSV header
     csv_header = ["Filename", "Timestamp (ISO 8601)", "Log Message", "Timestamp Type", "Was Converted"]
 
-    # Ensure the output directory exists
+    # Ensure the directory exists
     output_dir = os.path.dirname(output_file_path)
     if output_dir: # Check if output_dir is not an empty string (i.e., not current directory)
         os.makedirs(output_dir, exist_ok=True)
@@ -373,7 +342,7 @@ def save_log_entries_to_csv(log_entries, output_file_path):
         with open(output_file_path, 'w', newline='', encoding='utf-8') as csvfile:
             csv_writer = csv.writer(csvfile)
 
-            # Write the header row
+            # Write the header
             csv_writer.writerow(csv_header)
 
             # Wrap the loop with tqdm for a progress bar during saving
@@ -388,8 +357,8 @@ def save_log_entries_to_csv(log_entries, output_file_path):
 
 # Main execution flow
 if __name__ == "__main__":
-    # 1. Get user input for directory and date range
-    directory_path, start_date_str, end_date_str = get_user_input()
+    # 1. Get user input for directory, date range, and output filenames
+    directory_path, start_date_str, end_date_str, unfiltered_output_filename, filtered_output_filename = get_user_input()
 
     # 2. Find all files (potential log files) recursively in the specified directory
     log_files = []
@@ -425,9 +394,8 @@ if __name__ == "__main__":
     # Use parse_log_entries function which includes timestamp parsing and conversion to ISO 8601
     parsed_log_entries = parse_log_entries(all_log_entries, verbose=False) # Set verbose to True for detailed parsing output
 
-    # 5. Save the unfiltered parsed log entries to a CSV file in the home directory
-    unfiltered_output_csv_file = "/home/unfiltered_log_entries.csv"
-    save_log_entries_to_csv(parsed_log_entries, unfiltered_output_csv_file)
+    # 5. Save the unfiltered parsed log entries to a CSV file with user-specified filename
+    save_log_entries_to_csv(parsed_log_entries, unfiltered_output_filename)
 
     # 6. Filter the parsed log entries based on the user-specified date range
     filtered_log_entries = filter_log_entries_by_date(parsed_log_entries, start_date_str, end_date_str)
@@ -437,6 +405,5 @@ if __name__ == "__main__":
     sorted_filtered_log_entries = sort_log_entries_by_timestamp(filtered_log_entries)
     print(f"\nSorted {len(sorted_filtered_log_entries)} filtered log entries.")
 
-    # 8. Save the filtered and sorted log entries to a separate CSV file in the home directory
-    filtered_output_csv_file = "/home/filtered_log_entries.csv"
-    save_log_entries_to_csv(sorted_filtered_log_entries, filtered_output_csv_file)
+    # 8. Save the filtered and sorted log entries to a separate CSV file with user-specified filename
+    save_log_entries_to_csv(sorted_filtered_log_entries, filtered_output_filename)
