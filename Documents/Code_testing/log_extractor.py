@@ -202,121 +202,61 @@ class LogTimestampParser:
             return None, line.strip(), None # Return None for timestamp and type, and the original line
 
 
-def parse_log_entries(all_log_entries, verbose=False):
+# Removed the parse_log_entries function as parsing is now integrated into the main loop
+# def parse_log_entries(...): ...
+
+def filter_log_entries_by_date(parsed_entry, start_date_str, end_date_str):
     """
-    Parse log entries and convert timestamps to ISO 8601 format,
-    including identifying the timestamp type and if it was converted.
+    Filters a single parsed log entry by a specified date range.
 
     Args:
-        all_log_entries: List of (file_path, line) tuples.
-        verbose: If True, print detailed parsing output.
-
-    Returns:
-        List of (file_path, iso_timestamp_string, original_log_line, timestamp_type, was_converted) tuples.
-    """
-    parser_instance = LogTimestampParser()
-    parsed_log_entries = []
-
-    successful_parses = 0
-    failed_parses = 0
-
-    # Wrap the loop with tqdm for a progress bar
-    for file_path, line in tqdm(all_log_entries, desc="Parsing log entries", unit="entry"):
-        timestamp, original_line, timestamp_type = parser_instance.parse_log_line(line) # Get original line and type
-
-        was_converted = False
-        # Check if a timestamp was found and if its original type was not ISO 8601
-        if timestamp_type and timestamp_type != 'ISO 8601':
-            was_converted = True
-
-        if timestamp:
-            # Convert datetime object to ISO 8601 format with microsecond precision and timezone offset
-            iso_timestamp = timestamp.strftime('%Y-%m-%dT%H:%M:%S.%f%z')
-            # Ensure timezone offset is correctly formatted (e.g., +00:00 instead of +0000)
-            # This handles cases where strftime might output +0000
-            if iso_timestamp.endswith('00') and (iso_timestamp[-5] == '+' or iso_timestamp[-5] == '-'):
-                 iso_timestamp = iso_timestamp[:-2] + ':' + iso_timestamp[-2:]
-
-            # Store the parsed information including the original line, timestamp type, and conversion status
-            parsed_log_entries.append((file_path, iso_timestamp, original_line, timestamp_type, was_converted))
-            successful_parses += 1
-
-            if verbose:
-                conversion_status = "Converted" if was_converted else "Original ISO 8601"
-                # Print truncated line for readability in verbose mode
-                print(f"✓ Parsed ({timestamp_type}, {conversion_status}): {line[:50]}... -> {iso_timestamp}")
-        else:
-            # No timestamp found or couldn't parse
-            # Store the original line and mark timestamp as None, type as None, and not converted
-            parsed_log_entries.append((file_path, None, original_line, None, False))
-            failed_parses += 1
-
-            if verbose:
-                # Print truncated line for readability in verbose mode
-                print(f"✗ Failed: {line[:50]}...")
-
-    print(f"\nParsing Summary:")
-    print(f"  Successfully parsed: {successful_parses}")
-    print(f"  Failed to parse: {failed_parses}")
-    print(f"  Total entries: {len(all_log_entries)}")
-
-    return parsed_log_entries
-
-def filter_log_entries_by_date(parsed_log_entries, start_date_str, end_date_str):
-    """
-    Filters parsed log entries by a specified date range.
-
-    Args:
-        parsed_log_entries: List of (file_path, iso_timestamp_string, original_log_line, timestamp_type, was_converted) tuples.
+        parsed_entry: A single tuple (file_path, iso_timestamp_string, original_log_line, timestamp_type, was_converted).
         start_date_str: Start date string (YYYY-MM-DD).
         end_date_str: End date string (YYYY-MM-DD).
 
     Returns:
-        List of filtered log entries. Returns the original list if date parsing fails.
+        The parsed_entry tuple if it falls within the date range, otherwise None.
     """
+    # Convert start and end date strings to datetime objects once
+    # This conversion should ideally happen outside this function for efficiency
+    # but kept here for self-containment based on the previous function structure.
     try:
-        # Parse start and end dates and set time to beginning/end of the day for inclusive filtering
-        # Use dateutil_parser.parse for flexibility in date format parsing
         start_date = dateutil_parser.parse(start_date_str).replace(hour=0, minute=0, second=0, microsecond=0)
         end_date = dateutil_parser.parse(end_date_str).replace(hour=23, minute=59, second=59, microsecond=999999)
         date_filter_valid = True
     except (ValueError, TypeError):
         print("Error: Invalid start or end date format provided. Please use YYYY-MM-DD.")
-        date_filter_valid = False
-        return parsed_log_entries # If dates are invalid, return all entries
+        # If dates are invalid, no filtering can occur, so we'll indicate this.
+        return parsed_entry # Or None, depending on desired behavior for invalid dates. Let's return entry for now.
 
     if not date_filter_valid:
-        return parsed_log_entries
+        return parsed_entry # If dates were invalid, return the original entry
 
-    filtered_log_entries = []
-    # Wrap the loop with tqdm for a progress bar
-    for entry in tqdm(parsed_log_entries, desc="Filtering log entries", unit="entry"):
-        file_path, iso_timestamp, original_line, timestamp_type, was_converted = entry
-        if iso_timestamp:
-            try:
-                # Convert the ISO 8601 timestamp string back to a datetime object for comparison
-                entry_timestamp = dateutil_parser.isoparse(iso_timestamp)
+    file_path, iso_timestamp, original_line, timestamp_type, was_converted = parsed_entry
 
-                # To compare naive datetimes, we remove timezone info temporarily.
-                # This assumes all timestamps should be treated within the same local context
-                # for filtering purposes. Be cautious with mixed timezone logs.
-                # Also, convert start_date and end_date to timezone-aware datetimes in the local timezone
-                # before comparing with the potentially timezone-aware entry_timestamp.
-                start_date_aware = start_date.replace(tzinfo=tzlocal())
-                end_date_aware = end_date.replace(tzinfo=tzlocal())
+    if iso_timestamp:
+        try:
+            # Convert the ISO 8601 timestamp string back to a datetime object for comparison
+            entry_timestamp = dateutil_parser.isoparse(iso_timestamp)
 
+            # Ensure timezone awareness for comparison if needed (assuming timestamps are timezone aware)
+            # If timestamps from logs might be naive, a more robust approach might be needed
+            # For now, comparing timezone-aware datetimes directly is generally safe
+            start_date_aware = start_date.replace(tzinfo=tzlocal())
+            end_date_aware = end_date.replace(tzinfo=tzlocal())
 
-                if start_date_aware <= entry_timestamp <= end_date_aware:
-                    filtered_log_entries.append(entry)
-            except (ValueError, TypeError):
-                # Handle cases where the ISO timestamp string itself is invalid after parsing
-                print(f"Warning: Could not parse ISO timestamp for filtering: {iso_timestamp}. Skipping entry.")
-                pass
-        else:
-            # Entries with no timestamp are excluded from date filtering.
-            pass # Skip entries with no timestamp
+            if start_date_aware <= entry_timestamp <= end_date_aware:
+                return parsed_entry # Return the entry if it's within the date range
+        except (ValueError, TypeError):
+            # Handle cases where the ISO timestamp string itself is invalid after parsing
+            print(f"Warning: Could not parse ISO timestamp for filtering: {iso_timestamp}. Skipping entry.")
+            return None # Skip entry if its ISO timestamp is invalid for comparison
+    else:
+        # Entries with no timestamp are excluded from date filtering.
+        return None # Skip entries with no timestamp
 
-    return filtered_log_entries
+    return None # Return None if the entry does not meet the filter criteria
+
 
 def sort_log_entries_by_timestamp(log_entries):
     """
@@ -388,6 +328,19 @@ if __name__ == "__main__":
     unfiltered_output_filename = args.unfiltered_output
     filtered_output_filename = args.filtered_output
 
+    # Pre-parse start and end dates for filtering efficiency
+    try:
+        start_date_filter = dateutil_parser.parse(start_date_str).replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=tzlocal())
+        end_date_filter = dateutil_parser.parse(end_date_str).replace(hour=23, minute=59, second=59, microsecond=999999, tzinfo=tzlocal())
+        date_filter_valid_main = True
+    except (ValueError, TypeError):
+        print("Error: Invalid start or end date format provided via command line. Please use YYYY-MM-DD.")
+        date_filter_valid_main = False
+        # Decide how to proceed if dates are invalid - exit or process without filtering?
+        # Let's exit for now if required date arguments are invalid.
+        exit(1)
+
+
     # 3. Find all files (potential log files) recursively in the specified directory
     log_files = []
     # Walk through the directory and its subdirectories
@@ -400,40 +353,88 @@ if __name__ == "__main__":
 
     print(f"\nFound {len(log_files)} potential log files.")
 
-    # 4. Read log entries line by line from the found files
-    all_log_entries = []
-    # Use tqdm for a progress bar while reading files
-    for file_path in tqdm(log_files, desc="Reading log files", unit="file"):
-        try:
-            # Open and read each file, stripping leading/trailing whitespace from each line
-            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                for line in f:
-                    all_log_entries.append((file_path, line.strip()))
-        except IOError as e:
-            # Print an error message if a file cannot be read
-            print(f"Error reading file {file_path}: {e}")
-        except UnicodeDecodeError:
-             print(f"Warning: Could not decode file {file_path} with utf-8. Skipping.")
+    # 4. Process, parse, and filter log entries file by file to reduce memory usage
+    parsed_log_entries_unfiltered = [] # Temporarily store unfiltered parsed entries for saving
+    filtered_log_entries = [] # Store filtered entries in memory for sorting
+
+    parser_instance = LogTimestampParser() # Create parser instance once
+
+    unfiltered_csv_header = ["Filename", "Timestamp (ISO 8601)", "Log Message", "Timestamp Type", "Was Converted"]
+    filtered_csv_header = ["Filename", "Timestamp (ISO 8601)", "Log Message", "Timestamp Type", "Was Converted"]
 
 
-    print(f"\nRead {len(all_log_entries)} log entries.")
+    # Open the unfiltered CSV file for writing before processing starts
+    unfiltered_output_path = unfiltered_output_filename
+    unfiltered_file = None
+    unfiltered_writer = None
 
-    # 5. Parse log entries to extract timestamps and other information
-    # Use parse_log_entries function which includes timestamp parsing and conversion to ISO 8601
-    parsed_log_entries = parse_log_entries(all_log_entries, verbose=False) # Set verbose to True for detailed parsing output
+    try:
+        unfiltered_file = open(unfiltered_output_path, 'w', newline='', encoding='utf-8')
+        unfiltered_writer = csv.writer(unfiltered_file)
+        unfiltered_writer.writerow(unfiltered_csv_header) # Write header to unfiltered file
 
-    # 6. Save the unfiltered parsed log entries to a CSV file with user-specified filename
-    # Save to the current working directory by providing just the filename
-    save_log_entries_to_csv(parsed_log_entries, unfiltered_output_filename)
+        # Use tqdm for a progress bar while reading and processing files
+        for file_path in tqdm(log_files, desc="Processing files", unit="file"):
+            try:
+                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    for line in f:
+                        # Parse each line
+                        timestamp, original_line, timestamp_type = parser_instance.parse_log_line(line.strip())
 
-    # 7. Filter the parsed log entries based on the user-specified date range
-    filtered_log_entries = filter_log_entries_by_date(parsed_log_entries, start_date_str, end_date_str)
-    print(f"\nFiltered down to {len(filtered_log_entries)} log entries.")
+                        was_converted = False
+                        if timestamp_type and timestamp_type != 'ISO 8601':
+                            was_converted = True
 
-    # 8. Sort the filtered log entries by their timestamp
+                        iso_timestamp = None
+                        if timestamp:
+                            # Convert to ISO 8601 format with microsecond precision
+                            iso_timestamp = timestamp.strftime('%Y-%m-%dT%H:%M:%S.%f%z')
+                            # Ensure timezone offset is correctly formatted (e.g., +00:00 instead of +0000)
+                            if iso_timestamp.endswith('00') and (iso_timestamp[-5] == '+' or iso_timestamp[-5] == '-'):
+                                iso_timestamp = iso_timestamp[:-2] + ':' + iso_timestamp[-2:]
+
+                        # Create a tuple for the parsed entry
+                        parsed_entry = (file_path, iso_timestamp, original_line, timestamp_type, was_converted)
+
+                        # Write the parsed entry to the unfiltered CSV immediately
+                        unfiltered_writer.writerow(parsed_entry)
+
+                        # Filter the entry by date and collect in memory if it passes the filter
+                        if iso_timestamp and date_filter_valid_main: # Only filter if timestamp exists and dates are valid
+                            try:
+                                entry_timestamp = dateutil_parser.isoparse(iso_timestamp)
+                                start_date_aware = start_date_filter
+                                end_date_aware = end_date_filter
+
+                                if start_date_aware <= entry_timestamp <= end_date_aware:
+                                    filtered_log_entries.append(parsed_entry)
+                            except (ValueError, TypeError):
+                                # Handle cases where the ISO timestamp string itself is invalid after parsing
+                                print(f"Warning: Could not parse ISO timestamp for filtering: {iso_timestamp}. Skipping entry from filtered output.")
+                                pass
+            except IOError as e:
+                print(f"Error reading file {file_path}: {e}")
+            except UnicodeDecodeError:
+                 print(f"Warning: Could not decode file {file_path} with utf-8. Skipping.")
+
+    except IOError as e:
+        print(f"Error opening unfiltered output file {unfiltered_output_path}: {e}")
+    finally:
+        if unfiltered_file:
+            unfiltered_file.close()
+
+
+    print(f"\nProcessed and saved unfiltered entries to '{unfiltered_output_filename}'")
+    print(f"Collected {len(filtered_log_entries)} entries for filtering.")
+
+
+    # 5. Sort the filtered log entries
+    print("\nSorting filtered log entries...")
     sorted_filtered_log_entries = sort_log_entries_by_timestamp(filtered_log_entries)
-    print(f"\nSorted {len(sorted_filtered_log_entries)} filtered log entries.")
+    print(f"Sorted {len(sorted_filtered_log_entries)} filtered log entries.")
 
-    # 9. Save the filtered and sorted log entries to a separate CSV file with user-specified filename
-    # Save to the current working directory by providing just the filename
-    save_log_entries_to_csv(sorted_filtered_log_entries, filtered_output_filename)
+    # 6. Save the filtered and sorted log entries to a separate CSV file
+    filtered_output_path = filtered_output_filename
+    save_log_entries_to_csv(sorted_filtered_log_entries, filtered_output_path)
+
+    print("\nLog processing complete.")
