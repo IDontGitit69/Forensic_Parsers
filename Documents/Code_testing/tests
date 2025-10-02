@@ -1,0 +1,49 @@
+#!/usr/bin/env python3
+import os
+import argparse
+import yara
+import sys
+
+def compile_rule(rule_path):
+    """Compile a single YARA rule and return success/failure"""
+    try:
+        yara.compile(filepath=rule_path)
+        print(f"✅ {rule_path} compiled successfully!")
+        return True
+    except yara.SyntaxError as e:
+        print(f"❌ Syntax error in {rule_path}: {e}")
+        return False
+    except Exception as e:
+        print(f"❌ Unexpected error in {rule_path}: {e}")
+        return False
+
+def main():
+    parser = argparse.ArgumentParser(description="YARA Rule Syntax Checker")
+    parser.add_argument("path", help="Path to a YARA file or directory of YARA rules")
+    args = parser.parse_args()
+
+    path = args.path
+
+    if not os.path.exists(path):
+        print(f"Error: Path '{path}' does not exist.")
+        sys.exit(1)
+
+    # If path is a file, compile just that file
+    if os.path.isfile(path):
+        compile_rule(path)
+
+    # If path is a directory, compile all .yar / .yara files
+    elif os.path.isdir(path):
+        files = [f for f in os.listdir(path) if f.endswith((".yar", ".yara"))]
+        if not files:
+            print(f"No YARA files found in directory '{path}'")
+            sys.exit(1)
+        for f in files:
+            compile_rule(os.path.join(path, f))
+
+    else:
+        print(f"Error: '{path}' is neither a file nor a directory.")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
