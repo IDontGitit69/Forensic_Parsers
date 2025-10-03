@@ -1,20 +1,21 @@
 rule Example_Rule {
     meta:
         // === Required fields ===
-        author          = "Your Name or Team"         // REQUIRED: who wrote the rule
-        date            = "2025-10-03"                // REQUIRED: creation date (YYYY-MM-DD)
-        last_modified   = "2025-10-03"                // REQUIRED: last time this rule was updated
-        category        = "malware"                   // REQUIRED: category (e.g., malware, exploit, tool, artifact)
-        description     = "Detects XYZ malware variant" // REQUIRED: clear, plain-language description
-        classification  = "TLP:AMBER"                 // REQUIRED: sensitivity level (e.g., TLP, internal use)
+        author          = "Jane Doe"
+        date            = "2025-10-03"
+        last_modified   = "2025-10-03"
+        category        = "malware"
+        description     = "Detects XYZ malware variant"
+        classification  = "TLP:AMBER"
 
         // === Optional but recommended ===
-        reference       = "https://link.to/report"    // OPTIONAL: CVE, report, blog, MITRE ATT&CK ID (use "N/A" if none)
-        version         = "1.0"                       // OPTIONAL: version number for tracking updates
-        hash            = "abcdef123456..."           // OPTIONAL: sample hash if tied to specific artifact
+        reference       = "https://attack.mitre.org/techniques/T1059/"
+        version         = "1.0"
+        hash            = "abcdef123456..."
 
     strings:
-        // your strings here
+        $a = "malicious string here"
+
     condition:
-        // your condition here
+        $a
 }
