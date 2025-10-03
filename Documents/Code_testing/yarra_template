@@ -1,0 +1,20 @@
+rule Example_Rule {
+    meta:
+        // === Required fields ===
+        author          = "Your Name or Team"         // REQUIRED: who wrote the rule
+        date            = "2025-10-03"                // REQUIRED: creation date (YYYY-MM-DD)
+        last_modified   = "2025-10-03"                // REQUIRED: last time this rule was updated
+        category        = "malware"                   // REQUIRED: category (e.g., malware, exploit, tool, artifact)
+        description     = "Detects XYZ malware variant" // REQUIRED: clear, plain-language description
+        classification  = "TLP:AMBER"                 // REQUIRED: sensitivity level (e.g., TLP, internal use)
+
+        // === Optional but recommended ===
+        reference       = "https://link.to/report"    // OPTIONAL: CVE, report, blog, MITRE ATT&CK ID (use "N/A" if none)
+        version         = "1.0"                       // OPTIONAL: version number for tracking updates
+        hash            = "abcdef123456..."           // OPTIONAL: sample hash if tied to specific artifact
+
+    strings:
+        // your strings here
+    condition:
+        // your condition here
+}
