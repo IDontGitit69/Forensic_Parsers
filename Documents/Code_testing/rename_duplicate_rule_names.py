@@ -4,8 +4,10 @@ import argparse
 from collections import defaultdict
 
 # Regex to find YARA rule headers
-HEADER_RE = re.compile(r'^\s*(?:[A-Za-z_][A-Za-z0-9_]*\s+)*rule\s+([A-Za-z0-9_]+)\b',
-                       re.MULTILINE)
+HEADER_RE = re.compile(
+    r'^\s*(?:[A-Za-z_][A-Za-z0-9_]*\s+)*rule\s+([A-Za-z0-9_]+)\s*(?::[^{]*)?\{',
+    re.MULTILINE
+)
 
 def find_matching_brace(text, open_idx):
     """Find the index of the matching '}' starting at open_idx."""
