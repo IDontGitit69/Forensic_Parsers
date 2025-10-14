@@ -6,16 +6,19 @@ from tqdm import tqdm
 
 def list_yar_files(directory):
     """
-    Lists all .yar files in the given directory.
+    Recursively lists all .yar and .yara files in the given directory and subdirectories.
 
     Args:
         directory (str): The path to the directory to scan.
 
     Returns:
-        list: A list of filenames ending with '.yar'.
+        list: A list of full file paths ending with '.yar' or '.yara'.
     """
-    all_files = os.listdir(directory)
-    yar_files = [f for f in all_files if f.endswith('.yar')]
+    yar_files = []
+    for root, dirs, files in os.walk(directory):
+        for f in files:
+            if f.endswith('.yar') or f.endswith('.yara'):
+                yar_files.append(os.path.join(root, f))
     return yar_files
 
 def combine_rules(directory, yar_files):
@@ -24,23 +27,29 @@ def combine_rules(directory, yar_files):
 
     Args:
         directory (str): The path to the directory containing the YARA files.
-        yar_files (list): A list of .yar filenames to combine.
+        yar_files (list): A list of .yar file paths to combine.
 
     Returns:
-        str: A single string containing the combined content of all YARA files,
-             separated by newlines.
+        tuple: A tuple containing:
+            - str: A single string containing the combined content of all YARA files, separated by newlines.
+            - dict: A dictionary mapping rule names to their source filenames.
     """
     combined_rules = ""
+    rule_sources = {}  # Track which file each rule came from
+    
     for yar_file in tqdm(yar_files, desc="Reading YARA files"):
-        file_path = os.path.join(directory, yar_file)
         try:
-            with open(file_path, 'r') as f:
-                combined_rules += f.read() + "\n"
-        except FileNotFoundError:
-            print(f"Error: File not found at {file_path}")
+            with open(yar_file, 'r') as f:
+                file_content = f.read()
+                rule_names = re.findall(r"rule\s+([a-zA-Z0-9_]+)", file_content)
+                for rule_name in rule_names:
+                    if rule_name not in rule_sources:
+                        rule_sources[rule_name] = []
+                    rule_sources[rule_name].append(os.path.basename(yar_file))
+                combined_rules += file_content + "\n"
         except Exception as e:
-            print(f"An error occurred while reading {file_path}: {e}")
-    return combined_rules
+            print(f"Error reading {yar_file}: {e}")
+    return combined_rules, rule_sources
 
 def prefix_rule_names(rules_string):
     """
@@ -110,13 +119,14 @@ def remove_duplicate_rules(rules_string):
 
     return "\n".join(unique_rules.values())
 
-def handle_duplicate_rule_names(rules_string):
+def handle_duplicate_rule_names(rules_string, rule_sources):
     """
     Finds duplicate rule names and appends incremental numbers to duplicates.
 
     Args:
         rules_string (str): A string containing YARA rules with potentially
                             duplicate rule names.
+        rule_sources (dict): A dictionary mapping rule names to their source filenames.
 
     Returns:
         str: The modified string with duplicate rule names suffixed with
@@ -129,7 +139,14 @@ def handle_duplicate_rule_names(rules_string):
     # Identify names that appear more than once
     duplicate_rule_names = [name for name, count in rule_name_counts.items() if count > 1]
     num_duplicate_rule_names_found = len(duplicate_rule_names)
-    print(f"Number of duplicate rule names found: {num_duplicate_rule_names_found}")
+    print(f"\nNumber of duplicate rule names found: {num_duplicate_rule_names_found}")
+    
+    if duplicate_rule_names:
+        print("Duplicate rule names found in these files (kept first occurrence):")
+        for dup_name in duplicate_rule_names:
+            source_files = rule_sources.get(dup_name, ["Unknown"])
+            count = rule_name_counts[dup_name]
+            print(f"  - {dup_name} (appeared {count} times, found in: {', '.join(source_files)})")
 
     modified_rules = rules_string
     modified_count = Counter() # To keep track of how many times we've modified a duplicate name
@@ -234,7 +251,7 @@ def main():
     Handles command-line arguments, calls the processing functions, and
     provides informative output.
     """
-    parser = argparse.ArgumentParser(description="Process YARA rules from a directory.")
+    parser = argparse.ArgumentParser(description="Process YARA rules from a directory recursively.")
     parser.add_argument("-i", "--input-dir", help="Input directory containing YARA rule files", required=True)
     parser.add_argument("-o", "--output-file", help="Output filename for the master rule file", default="Master_Rules.yar")
     parser.add_argument("-d", "--output-dir", help="Output directory where the master rule file will be saved", default="Prod_Rules")
@@ -250,16 +267,16 @@ def main():
         print(f"Error: Input directory not found at {input_directory}")
         return
 
-
     yar_files = list_yar_files(input_directory)
     if not yar_files:
-        print(f"No .yar files found in {input_directory}")
+        print(f"No .yar or .yara files found in {input_directory} or its subdirectories")
         return
 
-    combined_rules = combine_rules(input_directory, yar_files)
+    print(f"Found {len(yar_files)} YARA file(s)")
+    combined_rules, rule_sources = combine_rules(input_directory, yar_files)
     prefixed_rules = prefix_rule_names(combined_rules)
     cleaned_rules = remove_duplicate_rules(prefixed_rules)
-    cleaned_rules_with_unique_names = handle_duplicate_rule_names(cleaned_rules)
+    cleaned_rules_with_unique_names = handle_duplicate_rule_names(cleaned_rules, rule_sources)
     final_rules = move_import_statements(cleaned_rules_with_unique_names)
     create_output_directory(output_directory)
     write_rules_file(output_directory, output_filename, final_rules)
