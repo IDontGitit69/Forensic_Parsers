@@ -274,7 +274,7 @@ def main():
 
     combined_rules, rule_sources = combine_rules(input_directory, yar_files)
     prefixed_rules = prefix_rule_names(combined_rules)
-    cleaned_rules = remove_duplicate_rules(prefixed_rules, rule_sources)
+    cleaned_rules = remove_duplicate_rules(prefixed_rules)
     cleaned_rules_with_unique_names = handle_duplicate_rule_names(cleaned_rules, rule_sources)
     final_rules = move_import_statements(cleaned_rules_with_unique_names)
     create_output_directory(output_directory)
