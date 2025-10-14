@@ -6,16 +6,16 @@ from tqdm import tqdm
 
 def list_yar_files(directory):
     """
-    Lists all .yar files in the given directory.
+    Lists all .yar and .yara files in the given directory.
 
     Args:
         directory (str): The path to the directory to scan.
 
     Returns:
-        list: A list of filenames ending with '.yar'.
+        list: A list of filenames ending with '.yar' or '.yara'.
     """
     all_files = os.listdir(directory)
-    yar_files = [f for f in all_files if f.endswith('.yar')]
+    yar_files = [f for f in all_files if f.endswith('.yar') or f.endswith('.yara')]
     return yar_files
 
 def combine_rules(directory, yar_files):
