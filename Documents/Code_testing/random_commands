@@ -1,0 +1,9 @@
+stages:
+  - test
+
+test-runner:
+  stage: test
+  script:
+    - echo "Hello from the GitLab Runner!"
+    - uname -a
+    - whoami
