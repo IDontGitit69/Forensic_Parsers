@@ -35,19 +35,18 @@ def combine_rules(directory, yar_files):
     rule_sources = {}  # Track which file each rule came from
     
     for yar_file in tqdm(yar_files, desc="Reading YARA files"):
-        file_path = os.path.join(directory, yar_file)
-        try:
-            with open(file_path, 'r') as f:
-                file_content = f.read()
-                # Extract rule names from this file
-                rule_names = re.findall(r"rule\s+([a-zA-Z0-9_]+)", file_content)
-                for rule_name in rule_names:
-                    rule_sources[rule_name] = yar_file
-                combined_rules += file_content + "\n"
-        except FileNotFoundError:
-            print(f"Error: File not found at {file_path}")
-        except Exception as e:
-            print(f"An error occurred while reading {file_path}: {e}")
+    file_path = os.path.join(directory, yar_file)
+    try:
+        with open(file_path, 'r') as f:
+            file_content = f.read()
+            rule_names = re.findall(r"rule\s+([a-zA-Z0-9_]+)", file_content)
+            for rule_name in rule_names:
+                if rule_name not in rule_sources:
+                    rule_sources[rule_name] = []
+                rule_sources[rule_name].append(yar_file)
+            combined_rules += file_content + "\n"
+    except Exception as e:
+        print(f"Error reading {file_path}: {e}")
     return combined_rules, rule_sources
 
 def prefix_rule_names(rules_string):
@@ -141,11 +140,11 @@ def handle_duplicate_rule_names(rules_string, rule_sources):
     print(f"\nNumber of duplicate rule names found: {num_duplicate_rule_names_found}")
     
     if duplicate_rule_names:
-        print("Discarded duplicate rule names (kept first occurrence):")
-        for dup_name in duplicate_rule_names:
-            source_file = rule_sources.get(dup_name, "Unknown")
-            count = rule_name_counts[dup_name]
-            print(f"  - {dup_name} (appeared {count} times, found in: {source_file})")
+    print("Duplicate rule names found in these files (kept first occurrence):")
+    for dup_name in duplicate_rule_names:
+        source_files = rule_sources.get(dup_name, ["Unknown"])
+        count = rule_name_counts[dup_name]
+        print(f"  - {dup_name} (appeared {count} times, found in: {', '.join(source_files)})")
 
     modified_rules = rules_string
     modified_count = Counter() # To keep track of how many times we've modified a duplicate name
