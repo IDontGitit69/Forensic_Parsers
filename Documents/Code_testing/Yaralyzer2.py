@@ -140,11 +140,11 @@ def handle_duplicate_rule_names(rules_string, rule_sources):
     print(f"\nNumber of duplicate rule names found: {num_duplicate_rule_names_found}")
     
     if duplicate_rule_names:
-    print("Duplicate rule names found in these files (kept first occurrence):")
-    for dup_name in duplicate_rule_names:
-        source_files = rule_sources.get(dup_name, ["Unknown"])
-        count = rule_name_counts[dup_name]
-        print(f"  - {dup_name} (appeared {count} times, found in: {', '.join(source_files)})")
+        print("Duplicate rule names found in these files (kept first occurrence):")
+        for dup_name in duplicate_rule_names:
+            source_files = rule_sources.get(dup_name, ["Unknown"])
+            count = rule_name_counts[dup_name]
+            print(f"  - {dup_name} (appeared {count} times, found in: {', '.join(source_files)})")
 
     modified_rules = rules_string
     modified_count = Counter() # To keep track of how many times we've modified a duplicate name
