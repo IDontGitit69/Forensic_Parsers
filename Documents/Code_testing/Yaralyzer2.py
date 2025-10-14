@@ -27,20 +27,28 @@ def combine_rules(directory, yar_files):
         yar_files (list): A list of .yar filenames to combine.
 
     Returns:
-        str: A single string containing the combined content of all YARA files,
-             separated by newlines.
+        tuple: A tuple containing:
+            - str: A single string containing the combined content of all YARA files, separated by newlines.
+            - dict: A dictionary mapping rule names to their source filenames.
     """
     combined_rules = ""
+    rule_sources = {}  # Track which file each rule came from
+    
     for yar_file in tqdm(yar_files, desc="Reading YARA files"):
         file_path = os.path.join(directory, yar_file)
         try:
             with open(file_path, 'r') as f:
-                combined_rules += f.read() + "\n"
+                file_content = f.read()
+                # Extract rule names from this file
+                rule_names = re.findall(r"rule\s+([a-zA-Z0-9_]+)", file_content)
+                for rule_name in rule_names:
+                    rule_sources[rule_name] = yar_file
+                combined_rules += file_content + "\n"
         except FileNotFoundError:
             print(f"Error: File not found at {file_path}")
         except Exception as e:
             print(f"An error occurred while reading {file_path}: {e}")
-    return combined_rules
+    return combined_rules, rule_sources
 
 def prefix_rule_names(rules_string):
     """
@@ -170,10 +178,20 @@ def move_import_statements(rules_string):
     # Remove duplicates while preserving order
     seen = set()
     unique_imports = []
+    duplicate_imports = []
+    
     for imp in import_statements:
         if imp not in seen:
             seen.add(imp)
             unique_imports.append(imp)
+        else:
+            duplicate_imports.append(imp)
+    
+    if duplicate_imports:
+        print(f"\nNumber of duplicate import statements removed: {len(duplicate_imports)}")
+        print("Discarded duplicate imports:")
+        for imp in set(duplicate_imports):
+            print(f"  - {imp}")
     
     # Join the unique import statements into a single string
     import_string = "\n".join(unique_imports)
@@ -227,11 +245,12 @@ def main():
     parser = argparse.ArgumentParser(description="Process YARA rules from a directory.")
     parser.add_argument("-i", "--input-dir", help="Input directory containing YARA rule files", required=True)
     parser.add_argument("-o", "--output-file", help="Output filename for the master rule file", default="Master_Rules.yar")
+    parser.add_argument("-d", "--output-dir", help="Output directory where the master rule file will be saved", default="Prod_Rules")
 
     args = parser.parse_args()
 
     input_directory = args.input_dir
-    output_directory = 'Prod_Rules' # Keep this fixed as per the original task
+    output_directory = args.output_dir
     output_filename = args.output_file
 
     # Check if input directory exists
@@ -245,9 +264,9 @@ def main():
         print(f"No .yar files found in {input_directory}")
         return
 
-    combined_rules = combine_rules(input_directory, yar_files)
+    combined_rules, rule_sources = combine_rules(input_directory, yar_files)
     prefixed_rules = prefix_rule_names(combined_rules)
-    cleaned_rules = remove_duplicate_rules(prefixed_rules)
+    cleaned_rules = remove_duplicate_rules(prefixed_rules, rule_sources)
     cleaned_rules_with_unique_names = handle_duplicate_rule_names(cleaned_rules)
     final_rules = move_import_statements(cleaned_rules_with_unique_names)
     create_output_directory(output_directory)
@@ -255,7 +274,7 @@ def main():
 
     # Count the final number of rules by finding all lines starting with "rule "
     final_rule_count = len(re.findall(r"^rule\s+[a-zA-Z0-9_]+", final_rules, re.MULTILINE))
-    print(f"Final number of rules: {final_rule_count}")
+    print(f"\nFinal number of rules: {final_rule_count}")
 
     print(f"Processed rules saved to {os.path.join(output_directory, output_filename)}")
 
