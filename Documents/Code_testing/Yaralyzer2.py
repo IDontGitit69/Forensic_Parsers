@@ -35,18 +35,18 @@ def combine_rules(directory, yar_files):
     rule_sources = {}  # Track which file each rule came from
     
     for yar_file in tqdm(yar_files, desc="Reading YARA files"):
-    file_path = os.path.join(directory, yar_file)
-    try:
-        with open(file_path, 'r') as f:
-            file_content = f.read()
-            rule_names = re.findall(r"rule\s+([a-zA-Z0-9_]+)", file_content)
-            for rule_name in rule_names:
-                if rule_name not in rule_sources:
-                    rule_sources[rule_name] = []
-                rule_sources[rule_name].append(yar_file)
-            combined_rules += file_content + "\n"
-    except Exception as e:
-        print(f"Error reading {file_path}: {e}")
+        file_path = os.path.join(directory, yar_file)
+        try:
+            with open(file_path, 'r') as f:
+                file_content = f.read()
+                rule_names = re.findall(r"rule\s+([a-zA-Z0-9_]+)", file_content)
+                for rule_name in rule_names:
+                    if rule_name not in rule_sources:
+                        rule_sources[rule_name] = []
+                    rule_sources[rule_name].append(yar_file)
+                combined_rules += file_content + "\n"
+        except Exception as e:
+            print(f"Error reading {file_path}: {e}")
     return combined_rules, rule_sources
 
 def prefix_rule_names(rules_string):
