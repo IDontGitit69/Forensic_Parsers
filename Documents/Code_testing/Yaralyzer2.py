@@ -118,13 +118,14 @@ def remove_duplicate_rules(rules_string):
 
     return "\n".join(unique_rules.values())
 
-def handle_duplicate_rule_names(rules_string):
+def handle_duplicate_rule_names(rules_string, rule_sources):
     """
     Finds duplicate rule names and appends incremental numbers to duplicates.
 
     Args:
         rules_string (str): A string containing YARA rules with potentially
                             duplicate rule names.
+        rule_sources (dict): A dictionary mapping rule names to their source filenames.
 
     Returns:
         str: The modified string with duplicate rule names suffixed with
@@ -137,7 +138,14 @@ def handle_duplicate_rule_names(rules_string):
     # Identify names that appear more than once
     duplicate_rule_names = [name for name, count in rule_name_counts.items() if count > 1]
     num_duplicate_rule_names_found = len(duplicate_rule_names)
-    print(f"Number of duplicate rule names found: {num_duplicate_rule_names_found}")
+    print(f"\nNumber of duplicate rule names found: {num_duplicate_rule_names_found}")
+    
+    if duplicate_rule_names:
+        print("Discarded duplicate rule names (kept first occurrence):")
+        for dup_name in duplicate_rule_names:
+            source_file = rule_sources.get(dup_name, "Unknown")
+            count = rule_name_counts[dup_name]
+            print(f"  - {dup_name} (appeared {count} times, found in: {source_file})")
 
     modified_rules = rules_string
     modified_count = Counter() # To keep track of how many times we've modified a duplicate name
@@ -267,7 +275,7 @@ def main():
     combined_rules, rule_sources = combine_rules(input_directory, yar_files)
     prefixed_rules = prefix_rule_names(combined_rules)
     cleaned_rules = remove_duplicate_rules(prefixed_rules, rule_sources)
-    cleaned_rules_with_unique_names = handle_duplicate_rule_names(cleaned_rules)
+    cleaned_rules_with_unique_names = handle_duplicate_rule_names(cleaned_rules, rule_sources)
     final_rules = move_import_statements(cleaned_rules_with_unique_names)
     create_output_directory(output_directory)
     write_rules_file(output_directory, output_filename, final_rules)
