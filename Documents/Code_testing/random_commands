@@ -1,1 +1,32 @@
 
+Forensic Weekly Activity Report – [Week of DATE]
+
+Deliverable Project Work – Rule Validation and CI Integration
+
+Progress:
+
+Developed a YARA rule validation script to independently validate and compile rules, ensuring dependencies and imports are properly handled.
+
+Created a rule consolidation script that merges validated rules into a single standardized file for use in tools like THOR.
+
+Implemented an initial CI pipeline that performs linting on consolidated rules to detect syntax errors, duplicates, and compatibility issues with the existing THOR ruleset.
+
+Next Steps:
+
+Integrate the validation script directly into the CI pipeline for automated end-to-end rule compilation and verification.
+
+Identify a persistent GitLab runner solution capable of reliably communicating with the master repository to support consistent CI/CD execution.
+
+Issues / Roadblocks:
+
+Runner availability: Current local runner functions but lacks network accessibility and persistence. A long-term hosting solution is required.
+
+Internal rule sourcing: External rules (e.g., Mandiant, YARA Forge) can be automated, but internal rule ingestion requires clarification. Coordination with [X organization] may help identify existing storage locations or staging environments for automation.
+
+Engagement Work:
+
+Reviewed and analyzed a confidential threat report from a security vendor containing TTPs and hunting procedures.
+
+Validated previously identified indicators of compromise based on the new intelligence.
+
+Determined that most of the new TTP-based hunts will be applicable to an upcoming customer image, pending its availability for testing and validation.
