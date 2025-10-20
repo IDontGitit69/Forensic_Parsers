@@ -23,22 +23,29 @@ def load_imports_file(imports_path: Path) -> str:
         raise FileNotFoundError(f"Imports file not found: {imports_path}")
     
     try:
-        content = imports_path.read_text(encoding='utf-8').strip()
+        content = imports_path.read_text(encoding='utf-8')
     except Exception as e:
         raise ValueError(f"Error reading imports file: {e}")
     
-    # Validate that the file only contains import statements and comments
+    # Extract only the import statements
     lines = content.split('\n')
+    import_lines = []
+    
     for line in lines:
         stripped = line.strip()
-        if stripped and not stripped.startswith('import') and not stripped.startswith('//') and not stripped.startswith('/*'):
-            raise ValueError(f"Imports file contains non-import statement: {line}")
+        # Include import statements and skip comments/empty lines
+        if stripped.startswith('import '):
+            import_lines.append(line)
     
-    # Ensure content ends with a newline for proper concatenation
-    if content and not content.endswith('\n'):
-        content += '\n'
+    if not import_lines:
+        raise ValueError("No import statements found in imports file")
     
-    return content
+    # Join with newlines and ensure proper formatting
+    imports_content = '\n'.join(import_lines)
+    if not imports_content.endswith('\n'):
+        imports_content += '\n'
+    
+    return imports_content
 
 
 def extract_imports(content: str) -> Tuple[str, str]:
@@ -51,21 +58,29 @@ def extract_imports(content: str) -> Tuple[str, str]:
     Returns:
         Tuple of (import_statements, remaining_content)
     """
-    # Match all import statements at the beginning
-    import_pattern = r'^\s*import\s+"[^"]+"\s*\n'
-    imports = []
-    remaining = content
+    lines = content.split('\n')
+    import_lines = []
+    remaining_lines = []
+    found_non_import = False
     
-    # Extract all consecutive import statements from the start
-    while True:
-        match = re.match(import_pattern, remaining, re.MULTILINE)
-        if not match:
-            break
-        imports.append(match.group(0))
-        remaining = remaining[match.end():]
+    for line in lines:
+        stripped = line.strip()
+        # If we haven't found non-import content yet and this is an import
+        if not found_non_import and stripped.startswith('import '):
+            import_lines.append(line)
+        else:
+            # Once we hit non-import content, everything else is remaining
+            if stripped and not stripped.startswith('//') and not stripped.startswith('/*'):
+                found_non_import = True
+            remaining_lines.append(line)
     
-    import_block = "".join(imports)
-    return import_block, remaining
+    import_block = '\n'.join(import_lines)
+    if import_block and not import_block.endswith('\n'):
+        import_block += '\n'
+    
+    remaining_content = '\n'.join(remaining_lines)
+    
+    return import_block, remaining_content
 
 
 def extract_rules(content: str) -> List[str]:
@@ -81,7 +96,7 @@ def extract_rules(content: str) -> List[str]:
     # Split on 'rule' keyword at the start of a line
     # This regex captures 'rule' and everything up to the next 'rule' or end of string
     rule_pattern = re.compile(
-        r'rule\s+[a-zA-Z0-9_]+(?:\s*:\s*[^\{]+)?\s*\{.*?(?=\n\s*rule\s+[a-zA-Z0-9_]+|\Z)',
+        r'(rule\s+[a-zA-Z0-9_]+(?:\s*:\s*[^\{]+)?\s*\{[^\}]*\})',
         re.DOTALL
     )
     
@@ -104,17 +119,24 @@ def extract_rule_name(rule_string: str) -> str:
     return match.group(1) if match else "Unnamed Rule"
 
 
-def validate_rule(rule_string: str, rule_name: str) -> Tuple[bool, str]:
+def validate_rule(rule_string: str, rule_name: str, debug: bool = False) -> Tuple[bool, str]:
     """
     Validates a single YARA rule string.
 
     Args:
         rule_string: A string containing the YARA rule with imports.
         rule_name: The name of the rule being validated.
+        debug: If True, print the rule being validated.
 
     Returns:
         Tuple of (success (bool), message (str)).
     """
+    if debug:
+        print(f"\n--- Validating rule '{rule_name}' ---")
+        print("Rule content being validated:")
+        print(rule_string[:500] + "..." if len(rule_string) > 500 else rule_string)
+        print("--- End of rule content ---\n")
+    
     try:
         yara.compile(source=rule_string)
         return True, f"Rule '{rule_name}' validated successfully."
@@ -124,13 +146,14 @@ def validate_rule(rule_string: str, rule_name: str) -> Tuple[bool, str]:
         return False, f"Rule '{rule_name}' unexpected error: {e}"
 
 
-def process_single_file(file_path: Path, global_imports: Optional[str] = None) -> List[Tuple[bool, str, str]]:
+def process_single_file(file_path: Path, global_imports: Optional[str] = None, debug: bool = False) -> List[Tuple[bool, str, str]]:
     """
     Reads a YARA file, extracts individual rules, and validates each rule.
 
     Args:
         file_path: Path to the YARA file.
         global_imports: Optional string containing global import statements to prepend to each rule.
+        debug: If True, print debug information.
 
     Returns:
         List of tuples: (success (bool), message (str), rule_name (str))
@@ -145,27 +168,50 @@ def process_single_file(file_path: Path, global_imports: Optional[str] = None) -
     # Extract imports and remaining content from the file
     file_imports, rules_content = extract_imports(content)
     
+    if debug:
+        print(f"\n=== Processing file: {file_path} ===")
+        print(f"Global imports: {global_imports[:100] if global_imports else 'None'}...")
+        print(f"File imports: {file_imports[:100] if file_imports else 'None'}...")
+    
     # Extract individual rules
     rules = extract_rules(rules_content)
     
     if not rules:
         return [(False, "No YARA rules found in file", "N/A")]
     
-    # Combine global imports (if provided) with file imports
-    # Global imports take precedence and come first
+    if debug:
+        print(f"Found {len(rules)} rules in file")
+    
+    # Build the combined imports block
     combined_imports = ""
-    if global_imports:
+    
+    # Add global imports first (if provided)
+    if global_imports and global_imports.strip():
         combined_imports = global_imports
-    if file_imports:
+        if not combined_imports.endswith('\n'):
+            combined_imports += '\n'
+    
+    # Add file-specific imports (if any)
+    if file_imports and file_imports.strip():
         combined_imports += file_imports
+        if not combined_imports.endswith('\n'):
+            combined_imports += '\n'
+    
+    if debug and combined_imports:
+        print(f"\nCombined imports block to prepend:\n{combined_imports}")
     
     # Validate each rule with imports prepended
     validation_results = []
     for rule_string in rules:
         rule_name = extract_rule_name(rule_string)
-        # Prepend imports to each rule for validation
-        full_rule = combined_imports + "\n" + rule_string if combined_imports else rule_string
-        success, message = validate_rule(full_rule, rule_name)
+        
+        # Prepend combined imports to each rule for validation
+        if combined_imports:
+            full_rule = combined_imports + '\n' + rule_string
+        else:
+            full_rule = rule_string
+        
+        success, message = validate_rule(full_rule, rule_name, debug)
         validation_results.append((success, message, rule_name))
     
     return validation_results
@@ -268,7 +314,7 @@ def print_failures_only(all_results: Dict[Path, List[Tuple[bool, str, str]]]):
         print("\nNo failures found! All rules validated successfully.")
 
 
-def process_yara_validation(input_path: str, failures_only: bool = False, imports_file: Optional[str] = None):
+def process_yara_validation(input_path: str, failures_only: bool = False, imports_file: Optional[str] = None, debug: bool = False):
     """
     Main processing function to validate YARA rules.
 
@@ -276,6 +322,7 @@ def process_yara_validation(input_path: str, failures_only: bool = False, import
         input_path: Path to a directory or file containing YARA rules.
         failures_only: If True, only print failed validations.
         imports_file: Optional path to a file containing import statements.
+        debug: If True, print debug information during processing.
     """
     path = Path(input_path)
     
@@ -285,10 +332,10 @@ def process_yara_validation(input_path: str, failures_only: bool = False, import
         imports_path = Path(imports_file)
         try:
             global_imports = load_imports_file(imports_path)
-            print(f"Loaded global imports from: {imports_path}")
+            print(f"✓ Loaded global imports from: {imports_path}")
             print(f"Imports content:\n{global_imports}")
         except (FileNotFoundError, ValueError) as e:
-            print(f"Error loading imports file: {e}")
+            print(f"✗ Error loading imports file: {e}")
             return
     
     # Find all YARA files
@@ -297,13 +344,13 @@ def process_yara_validation(input_path: str, failures_only: bool = False, import
     if not yara_files:
         return
     
-    print(f"Found {len(yara_files)} YARA file(s) to process")
+    print(f"\nFound {len(yara_files)} YARA file(s) to process\n")
     
     # Process each file
     all_results = {}
     for file_path in yara_files:
         print(f"Processing: {file_path}")
-        results = process_single_file(file_path, global_imports)
+        results = process_single_file(file_path, global_imports, debug)
         all_results[file_path] = results
     
     # Print results
@@ -328,6 +375,7 @@ Examples:
   %(prog)s -i /path/to/single_rule.yar
   %(prog)s -i /path/to/rules/directory --failures-only
   %(prog)s -i /path/to/rules/directory --imports /path/to/imports.yar
+  %(prog)s -i /path/to/rules/directory --imports /path/to/imports.yar --debug
         """
     )
     
@@ -349,6 +397,12 @@ Examples:
         required=False
     )
     
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug output to see what's being validated"
+    )
+    
     args = parser.parse_args()
     
     # Get input path from args or prompt user
@@ -361,7 +415,7 @@ Examples:
         print("Error: No input path provided.")
         return
     
-    process_yara_validation(input_path, args.failures_only, args.imports)
+    process_yara_validation(input_path, args.failures_only, args.imports, args.debug)
 
 
 if __name__ == "__main__":
