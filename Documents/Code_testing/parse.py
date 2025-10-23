@@ -14,12 +14,15 @@ def parse_log_date(date_str, year=None):
         return None
 
 def extract_ip_from_dnsmasq(line):
-    """Extract IP address from dnsmasq log line (after 'from')"""
-    # Look for "from X.X.X.X" pattern
-    match = re.search(r'from\s+((?:\d{1,3}\.){3}\d{1,3})\b', line)
-    if match:
-        return match.group(1)
-    return None
+    """Extract IP address from dnsmasq log line"""
+    # Find all valid IP addresses in the line
+    ip_pattern = r'\b((?:\d{1,3}\.){3}\d{1,3})\b'
+    matches = re.findall(ip_pattern, line)
+    
+    # Filter out invalid IPs and return all valid ones
+    valid_ips = [ip for ip in matches if is_valid_ip(ip)]
+    
+    return valid_ips if valid_ips else []
 
 def is_valid_ip(ip):
     """Validate IP address octets are 0-255"""
@@ -80,9 +83,9 @@ def filter_logs_by_date(log_file, start_date, end_date, year=None):
                 # Check if date is within range
                 if start_parsed <= log_date <= end_parsed:
                     lines_matched += 1
-                    # Extract IP from log message
-                    ip = extract_ip_from_dnsmasq(line)
-                    if ip and is_valid_ip(ip):
+                    # Extract all IPs from log message
+                    ips = extract_ip_from_dnsmasq(line)
+                    for ip in ips:
                         ip_counts[ip] += 1
     
     except FileNotFoundError:
