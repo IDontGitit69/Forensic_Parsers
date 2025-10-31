@@ -1,4 +1,1 @@
 
-This week, I continued in-depth analysis of a customer-provided disk image containing malware. Through collaboration with other engagement members, we identified characteristics consistent with a previously analyzed image, confirming the same malware family based on the presence of a known malicious process.
-
-Additionally, I conducted advanced data carving of unallocated and slack space, leveraging custom keyword lists to identify TA-issued commands. This required decoding data encoded in UTF-16 and converting it to ASCII for analysis. The recovered artifacts revealed a consistent technique used by the threat actor to modify the /etc/hosts file, which may serve as a valuable indicator for identifying other impacted systems across the customer’s environment.
