@@ -374,4 +374,74 @@ cleanup_failed:
     - echo "✅ Cleaned up failed rules directory"
   
   rules:
-    - when: manual
+    - when: manual\
+
+# ==============================================================================
+# STAGE 2: REPORT
+# ==============================================================================
+
+generate_report:
+  stage: report
+  image: $PYTHON_IMAGE
+  dependencies:
+    - validate_yara_rules
+  script:
+    - echo "📊 Generating validation report"
+    
+    # Print summary from JSON report
+    - |
+      python3 << EOF
+      import json
+      import sys
+      
+      try:
+          with open('$JSON_REPORT', 'r') as f:
+              report = json.load(f)
+          
+          summary = report['summary']
+          print("\n" + "="*80)
+          print("VALIDATION SUMMARY")
+          print("="*80)
+          print(f"Total Rules:     {summary['total']}")
+          print(f"Valid Rules:     {summary['valid']}")
+          print(f"Broken Rules:    {summary['broken']}")
+          print(f"Repaired Rules:  {summary['repaired']}")
+          print(f"Success Rate:    {summary['success_rate']}%")
+          print("="*80 + "\n")
+          
+          # Exit with error if there are broken rules
+          if summary['broken'] > 0:
+              print(f"❌ {summary['broken']} rule(s) failed validation")
+              sys.exit(1)
+          else:
+              print("✅ All rules passed validation")
+              sys.exit(0)
+      except Exception as e:
+          print(f"Error reading report: {e}")
+          sys.exit(1)
+      EOF
+    
+    # Display markdown report
+    - |
+      if [ -f "$MD_REPORT" ]; then
+        echo "📝 Markdown Report:"
+        cat "$MD_REPORT"
+      fi
+    
+    # List failed rules
+    - |
+      if [ -d "$FAILED_DIR" ] && [ "$(ls -A $FAILED_DIR)" ]; then
+        echo ""
+        echo "❌ FAILED RULES:"
+        ls -1 "$FAILED_DIR"
+      fi
+  
+  artifacts:
+    when: always
+    reports:
+      # This creates a downloadable report in GitLab UI
+      dotenv: report.env
+    expire_in: 7 days
+  
+  # This job should fail if validation failed
+  allow_failure: false
