@@ -1,25 +1,41 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-CI/CD-Enhanced YARA Rule Validator with Multi-Rule File Support
+YARA Rule Validator for CI/CD Pipelines
 
-This script validates YARA rules and outputs them in formats suitable for CI/CD pipelines.
-It can parse multiple rules from a single file and validate each independently.
-It separates valid rules from broken ones and provides structured reports.
+This script validates YARA rule files with two operation modes:
+
+1. FILE MODE (Default): Validates entire files as-is, preserving all rules, imports, 
+   and dependencies together. This is the recommended mode for most use cases.
+
+2. SPLIT MODE (--split-rules): Parses individual rules from files and validates each 
+   separately. Useful for isolating issues in multi-rule files.
 
 Usage:
-    python validate_yara_rules.py <directory_path> [options]
+    # Validate entire files (recommended)
+    python validate_yara_rules.py <directory> --output-valid-dir validated/
+    
+    # Split and validate individual rules
+    python validate_yara_rules.py <directory> --split-rules --output-valid-dir validated/
 
 Examples:
+    # File mode: Validate complete files
+    python validate_yara_rules.py ./rules --output-valid-dir validated/
+    
+    # File mode: With failed files output
     python validate_yara_rules.py ./rules --output-valid-dir validated/ --output-failed-dir failed/
-    python validate_yara_rules.py ./rules --output-valid-dir validated/ --json-report report.json
+    
+    # Split mode: Parse and validate individual rules
+    python validate_yara_rules.py ./rules --split-rules --output-valid-dir validated/
+    
+    # Generate reports
+    python validate_yara_rules.py ./rules --json-report report.json --markdown-report report.md
 """
 
 import argparse
 import os
 import sys
 import glob
-import tempfile
 import shutil
 import re
 import json
@@ -33,24 +49,75 @@ except ImportError:
     sys.exit(1)
 
 
+# ============================================================================
+# YARA FILE REPRESENTATION
+# ============================================================================
+
+class YaraFile:
+    """Represents a complete YARA file with validation status."""
+    
+    STATUS_UNKNOWN = 'unknown'
+    STATUS_VALID = 'valid'
+    STATUS_BROKEN = 'broken'
+    
+    def __init__(self, filepath, content=None):
+        self.filepath = filepath
+        self.filename = os.path.basename(filepath)
+        self.content = content
+        self.status = self.STATUS_UNKNOWN
+        self.error_data = None
+        self.rule_count = 0
+    
+    def load_content(self):
+        """Load file content if not already loaded."""
+        if self.content is None:
+            try:
+                with open(self.filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                    self.content = f.read()
+            except Exception as e:
+                raise IOError(f"Failed to read {self.filepath}: {e}")
+        return self.content
+    
+    def count_rules(self):
+        """Count the number of rules in the file."""
+        if self.content:
+            rule_pattern = re.compile(r'(?i)^\s*(?:private\s+|global\s+)?rule\s+\w+', re.MULTILINE)
+            self.rule_count = len(rule_pattern.findall(self.content))
+        return self.rule_count
+    
+    def to_dict(self):
+        """Convert to dictionary for JSON serialization."""
+        return {
+            'filepath': self.filepath,
+            'filename': self.filename,
+            'status': self.status,
+            'rule_count': self.rule_count,
+            'error': self.error_data
+        }
+    
+    def __repr__(self):
+        return f"<YaraFile {self.filename} - {self.status} - {self.rule_count} rules>"
+
+
 class YaraRule:
     """Represents a single YARA rule with validation status."""
     
     STATUS_UNKNOWN = 'unknown'
     STATUS_VALID = 'valid'
     STATUS_BROKEN = 'broken'
-    STATUS_REPAIRED = 'repaired'
     
-    def __init__(self, source, namespace='', include_name='', path='', rule_name='', imports=''):
+    def __init__(self, source, source_file='', rule_name='', imports=''):
         self.source = source
-        self.namespace = namespace
-        self.include_name = include_name
-        self.path = path
-        self.rule_name = rule_name  # Extracted rule name
-        self.imports = imports  # Global imports to prepend
+        self.source_file = source_file
+        self.rule_name = rule_name or self._extract_name()
+        self.imports = imports
         self.status = self.STATUS_UNKNOWN
         self.error_data = None
-        self.repaired_source = None
+    
+    def _extract_name(self):
+        """Extract the rule name from source code."""
+        match = re.search(r'(?i)^\s*(?:private\s+|global\s+)?rule\s+(\w+)', self.source, re.MULTILINE)
+        return match.group(1) if match else "unknown_rule"
     
     def get_full_source(self):
         """Get complete source including imports."""
@@ -59,436 +126,224 @@ class YaraRule:
         return self.source
     
     def to_dict(self):
-        """Convert rule to dictionary for JSON serialization."""
+        """Convert to dictionary for JSON serialization."""
         return {
-            'path': self.path,
-            'include_name': self.include_name,
+            'source_file': self.source_file,
             'rule_name': self.rule_name,
-            'namespace': self.namespace,
             'status': self.status,
-            'error': self.error_data,
-            'has_repair': self.repaired_source is not None
+            'error': self.error_data
         }
-    
-    def __str__(self):
-        return self.source
     
     def __repr__(self):
         return f"<YaraRule {self.rule_name} - {self.status}>"
 
 
-def extract_rule_name(rule_source):
-    """Extract the rule name from rule source code."""
-    match = re.search(r'^\s*(?:private\s+|global\s+)?rule\s+(\w+)', rule_source, re.MULTILINE)
-    if match:
-        return match.group(1)
-    return "unknown_rule"
+# ============================================================================
+# RULE PARSING UTILITIES
+# ============================================================================
 
-
-def remove_comments_and_strings(text):
+def parse_yara_file_to_rules(filepath):
     """
-    Remove comments and string literals from YARA code to avoid false positives
-    when counting braces. This is more robust than the previous approach.
-    """
-    result = []
-    i = 0
-    length = len(text)
-    
-    while i < length:
-        # Check for single-line comment
-        if i < length - 1 and text[i:i+2] == '//':
-            # Skip until end of line
-            while i < length and text[i] != '\n':
-                i += 1
-            if i < length:
-                result.append('\n')  # Keep the newline
-                i += 1
-            continue
-        
-        # Check for multi-line comment
-        if i < length - 1 and text[i:i+2] == '/*':
-            # Skip until closing */
-            i += 2
-            while i < length - 1:
-                if text[i:i+2] == '*/':
-                    i += 2
-                    break
-                if text[i] == '\n':
-                    result.append('\n')  # Keep newlines for line counting
-                i += 1
-            continue
-        
-        # Check for double-quoted string
-        if text[i] == '"':
-            result.append(' ')  # Replace string with space
-            i += 1
-            while i < length:
-                if text[i] == '\\' and i + 1 < length:
-                    # Skip escaped character
-                    i += 2
-                    continue
-                if text[i] == '"':
-                    i += 1
-                    break
-                if text[i] == '\n':
-                    result.append('\n')  # Keep newlines
-                i += 1
-            continue
-        
-        # Check for single-quoted string (less common in YARA but possible)
-        if text[i] == "'":
-            result.append(' ')  # Replace string with space
-            i += 1
-            while i < length:
-                if text[i] == '\\' and i + 1 < length:
-                    # Skip escaped character
-                    i += 2
-                    continue
-                if text[i] == "'":
-                    i += 1
-                    break
-                if text[i] == '\n':
-                    result.append('\n')  # Keep newlines
-                i += 1
-            continue
-        
-        # Check for hex pattern like { 4D 5A 90 00 }
-        if text[i] == '{':
-            # Look ahead to see if this is a hex pattern
-            j = i + 1
-            is_hex_pattern = True
-            hex_chars = 0
-            
-            # Skip whitespace
-            while j < length and text[j] in ' \t\n\r':
-                j += 1
-            
-            # Check if next chars are hex digits
-            while j < length:
-                if text[j] in ' \t\n\r':
-                    j += 1
-                    continue
-                elif text[j] == '}':
-                    # Found closing brace after hex chars
-                    if hex_chars > 0:
-                        # This is a hex pattern, skip it
-                        result.append(' ')  # Replace with space
-                        i = j + 1
-                        is_hex_pattern = True
-                        break
-                    else:
-                        is_hex_pattern = False
-                        break
-                elif text[j] in '0123456789ABCDEFabcdef?':
-                    hex_chars += 1
-                    j += 1
-                    if hex_chars > 1:  # Need at least 2 chars for a hex byte
-                        # Skip to next whitespace or closing brace
-                        while j < length and text[j] not in ' \t\n\r}':
-                            j += 1
-                else:
-                    # Not a hex pattern
-                    is_hex_pattern = False
-                    break
-            
-            if is_hex_pattern and hex_chars > 0:
-                continue
-        
-        # Regular character
-        result.append(text[i])
-        i += 1
-    
-    return ''.join(result)
-
-
-def parse_yara_file_by_indentation(filepath):
-    """
-    Parse a YARA file and extract individual rules by tracking brace indentation.
-    This approach is more reliable for complex rules with braces in strings.
+    Parse a YARA file and extract individual rules with their imports.
+    Uses simple line-by-line approach to detect rule boundaries.
     
     Returns:
         tuple: (imports_string, list_of_rule_sources)
     """
     try:
-        with open(filepath, 'r', encoding='utf-8') as f:
-            content = f.read()
+        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+            lines = f.readlines()
     except Exception as e:
         print(f"Error reading file {filepath}: {e}", file=sys.stderr)
         return "", []
     
-    lines = content.split('\n')
+    # Pattern to detect start of YARA rules (case-insensitive)
+    rule_pattern = re.compile(r'(?i)^\s*(private\s+|global\s+)?rule\s+\w+')
     
-    # Extract imports from the beginning of the file
+    # Separate header (imports/comments) from rules
+    header_lines = []
+    rule_blocks = []
+    current_rule = []
+    in_rule = False
+    
+    for line in lines:
+        # Check if this line starts a new rule
+        if rule_pattern.match(line):
+            # If we were building a rule, save it
+            if current_rule:
+                rule_blocks.append(current_rule)
+            # Start a new rule
+            current_rule = [line]
+            in_rule = True
+        else:
+            # If we're not in a rule yet, this is part of the header
+            if not in_rule:
+                header_lines.append(line)
+            else:
+                # We're in a rule, add to current rule
+                current_rule.append(line)
+    
+    # Don't forget the last rule
+    if current_rule:
+        rule_blocks.append(current_rule)
+    
+    # Extract imports from header
     import_lines = []
-    content_start_idx = 0
-    
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        # Check if line is an import statement
+    for line in header_lines:
         if re.match(r'^\s*import\s+"[^"]+"\s*$', line):
-            import_lines.append(line)
-            content_start_idx = i + 1
-        elif stripped and not stripped.startswith('//') and not stripped.startswith('/*'):
-            # Stop at first non-import, non-comment, non-empty line
-            break
+            import_lines.append(line.rstrip())
     
     imports_string = '\n'.join(import_lines) if import_lines else ""
     
-    # Now parse rules using indentation-aware brace matching
+    # Convert rule blocks to strings
     rules = []
-    
-    # Remove comments and strings for accurate brace matching
-    clean_content = remove_comments_and_strings(content)
-    clean_lines = clean_content.split('\n')
-    
-    i = content_start_idx
-    while i < len(lines):
-        line = lines[i]
-        clean_line = clean_lines[i] if i < len(clean_lines) else ""
-        stripped = line.strip()
-        
-        # Look for rule definition
-        if re.match(r'^\s*(?:private\s+|global\s+)?rule\s+\w+', stripped):
-            # Found a rule start
-            rule_start = i
-            rule_lines = [line]
-            
-            # Find the opening brace and its indentation
-            opening_brace_indent = None
-            j = i
-            
-            # The opening brace might be on the same line or the next line
-            while j < len(clean_lines):
-                if '{' in clean_lines[j]:
-                    # Find the position of the opening brace
-                    brace_pos = clean_lines[j].index('{')
-                    # Calculate indentation (number of leading spaces/tabs)
-                    opening_brace_indent = len(lines[j]) - len(lines[j].lstrip())
-                    
-                    if j > i:
-                        # Opening brace is on a different line, include those lines
-                        for k in range(i + 1, j + 1):
-                            rule_lines.append(lines[k])
-                    
-                    j += 1
-                    break
-                else:
-                    if j > i:
-                        rule_lines.append(lines[j])
-                    j += 1
-            
-            if opening_brace_indent is None:
-                # No opening brace found, skip this rule
-                i += 1
-                continue
-            
-            # Now find the matching closing brace at the same indentation
-            brace_count = 1
-            found_closing = False
-            
-            while j < len(clean_lines) and brace_count > 0:
-                current_line = clean_lines[j]
-                original_line = lines[j]
-                
-                # Count braces in the clean line
-                for char in current_line:
-                    if char == '{':
-                        brace_count += 1
-                    elif char == '}':
-                        brace_count -= 1
-                        if brace_count == 0:
-                            # Found the matching closing brace
-                            rule_lines.append(original_line)
-                            found_closing = True
-                            break
-                
-                if not found_closing:
-                    rule_lines.append(original_line)
-                    j += 1
-                else:
-                    break
-            
-            if found_closing:
-                # We have a complete rule
-                rule_source = '\n'.join(rule_lines)
-                rules.append(rule_source.strip())
-                i = j + 1
-            else:
-                # Incomplete rule, skip it
-                i += 1
-        else:
-            i += 1
-    
-    # If no rules found, treat entire file as one rule
-    if not rules:
-        content_without_imports = '\n'.join(lines[content_start_idx:]).strip()
-        if content_without_imports:
-            rules.append(content_without_imports)
+    for rule_block in rule_blocks:
+        rule_text = ''.join(rule_block).strip()
+        if rule_text:
+            rules.append(rule_text)
     
     return imports_string, rules
 
 
-def parse_yara_file(filepath):
-    """
-    Parse a YARA file and extract individual rules with their imports.
-    Uses the improved indentation-based parsing.
-    
-    Returns:
-        tuple: (imports_string, list_of_rule_sources)
-    """
-    return parse_yara_file_by_indentation(filepath)
+# ============================================================================
+# VALIDATORS
+# ============================================================================
 
-
-class YaraValidator:
-    """Validates YARA rules with repair capabilities."""
+class FileValidator:
+    """Validates complete YARA files."""
     
-    def __init__(self, auto_clear=True):
-        self.rules = []
-        self.auto_clear = auto_clear
-        self.tmp_dir = tempfile.mkdtemp(prefix='yara_validator_')
-        self.include_map = {}
+    def __init__(self):
+        self.files = []
+        self.all_rule_names = {}  # Track rule names across all files: {rule_name: [file1, file2, ...]}
     
-    def add_rule_source(self, source, namespace='', include_name='', rule_name='', imports=''):
-        """Add a YARA rule from source string."""
-        if not rule_name:
-            rule_name = extract_rule_name(source)
+    def add_file(self, filepath):
+        """Add a YARA file for validation."""
+        yara_file = YaraFile(filepath)
+        self.files.append(yara_file)
+        return yara_file
+    
+    def _extract_rule_names_from_file(self, yara_file):
+        """Extract all rule names from a file."""
+        if not yara_file.content:
+            return []
         
-        rule = YaraRule(source, namespace, include_name, '', rule_name, imports)
-        self.rules.append(rule)
-        if include_name:
-            self.include_map[include_name] = rule
+        rule_pattern = re.compile(r'(?i)^\s*(?:private\s+|global\s+)?rule\s+(\w+)', re.MULTILINE)
+        matches = rule_pattern.findall(yara_file.content)
+        return matches
     
-    def add_rule_file(self, filepath, namespace='', include_name=''):
-        """Add YARA rules from file, parsing multiple rules if present."""
+    def validate_file(self, yara_file):
+        """Validate a single YARA file."""
         try:
-            if not include_name:
-                include_name = os.path.basename(filepath)
-            if not namespace:
-                namespace = os.path.dirname(filepath)
+            # Load content
+            content = yara_file.load_content()
+            yara_file.count_rules()
             
-            # Parse file to extract imports and individual rules
-            imports, rule_sources = parse_yara_file(filepath)
+            # Extract rule names and track them
+            rule_names = self._extract_rule_names_from_file(yara_file)
+            for rule_name in rule_names:
+                if rule_name not in self.all_rule_names:
+                    self.all_rule_names[rule_name] = []
+                self.all_rule_names[rule_name].append(yara_file.filepath)
             
-            if not rule_sources:
-                print(f"  ⚠️  No rules found in {filepath}", file=sys.stderr)
-                return
+            # Validate by compiling
+            yara.compile(source=content)
+            yara_file.status = YaraFile.STATUS_VALID
+            return True
             
-            # Create a YaraRule object for each parsed rule
-            for rule_source in rule_sources:
-                rule_name = extract_rule_name(rule_source)
-                
-                # Create unique include name if multiple rules in file
-                if len(rule_sources) > 1:
-                    rule_include_name = f"{include_name}::{rule_name}"
-                else:
-                    rule_include_name = include_name
-                
-                rule = YaraRule(
-                    source=rule_source,
-                    namespace=namespace,
-                    include_name=rule_include_name,
-                    path=filepath,
-                    rule_name=rule_name,
-                    imports=imports
-                )
-                self.rules.append(rule)
-                self.include_map[rule_include_name] = rule
-                
+        except yara.Error as e:
+            yara_file.status = YaraFile.STATUS_BROKEN
+            yara_file.error_data = str(e)
+            return False
         except Exception as e:
-            print(f"Error processing file {filepath}: {e}", file=sys.stderr)
+            yara_file.status = YaraFile.STATUS_BROKEN
+            yara_file.error_data = f"Failed to process file: {str(e)}"
+            return False
     
-    def _attempt_repair(self, source, imports=''):
-        """Attempt to repair common YARA rule issues."""
-        repaired = source
-        repairs = []
+    def validate_all(self):
+        """Validate all files and return categorized lists."""
+        valid = []
+        broken = []
         
-        # Fix missing "condition:" keyword
-        if 'condition' not in repaired and '{' in repaired:
-            repaired = re.sub(
-                r'(\{[^}]*?)(true|false|and|or|[0-9]+)',
-                r'\1condition: \2',
-                repaired
+        for yara_file in self.files:
+            if self.validate_file(yara_file):
+                valid.append(yara_file)
+            else:
+                broken.append(yara_file)
+        
+        return valid, broken
+    
+    def get_duplicate_rules(self):
+        """Get all duplicate rule names across all files."""
+        duplicates = {}
+        for rule_name, file_list in self.all_rule_names.items():
+            if len(file_list) > 1:
+                duplicates[rule_name] = file_list
+        return duplicates
+
+
+class RuleValidator:
+    """Validates individual YARA rules (split mode)."""
+    
+    def __init__(self):
+        self.rules = []
+        self.rule_names = {}  # Track rule names: {rule_name: [rule_obj1, rule_obj2, ...]}
+    
+    def add_file(self, filepath):
+        """Parse a file and add all its rules for validation."""
+        imports, rule_sources = parse_yara_file_to_rules(filepath)
+        
+        for rule_source in rule_sources:
+            rule = YaraRule(
+                source=rule_source,
+                source_file=filepath,
+                imports=imports
             )
-            if repaired != source:
-                repairs.append("Added missing 'condition:' keyword")
+            self.rules.append(rule)
+            
+            # Track rule name
+            if rule.rule_name not in self.rule_names:
+                self.rule_names[rule.rule_name] = []
+            self.rule_names[rule.rule_name].append(rule)
         
-        # Fix missing closing brace using the same logic
-        clean_repaired = remove_comments_and_strings(repaired)
-        open_braces = clean_repaired.count('{')
-        close_braces = clean_repaired.count('}')
-        
-        if open_braces != close_braces:
-            if open_braces > close_braces:
-                repaired += '\n}'
-                repairs.append("Added missing closing brace")
-        
-        # Fix missing rule name
-        if not re.search(r'rule\s+\w+\s*\{', repaired):
-            if 'rule' in repaired and '{' in repaired:
-                repaired = re.sub(r'rule\s*\{', 'rule DefaultRule {', repaired)
-                repairs.append("Added missing rule name")
-        
-        return repaired, repairs
+        return len(rule_sources)
     
-    def _validate_rule(self, rule, accept_repairs=False):
+    def validate_rule(self, rule):
         """Validate a single rule."""
         try:
-            # Try to compile the rule with imports
             full_source = rule.get_full_source()
             yara.compile(source=full_source)
             rule.status = YaraRule.STATUS_VALID
             return True
         except yara.Error as e:
-            rule.error_data = str(e)
-            
-            # Try to repair
-            if accept_repairs:
-                repaired_source, repairs = self._attempt_repair(rule.source, rule.imports)
-                if repaired_source != rule.source:
-                    try:
-                        # Test with imports
-                        full_repaired = f"{rule.imports}\n\n{repaired_source}" if rule.imports else repaired_source
-                        yara.compile(source=full_repaired)
-                        rule.status = YaraRule.STATUS_REPAIRED
-                        rule.repaired_source = repaired_source
-                        rule.error_data = f"Repaired: {', '.join(repairs)}"
-                        return True
-                    except yara.Error:
-                        pass
-            
             rule.status = YaraRule.STATUS_BROKEN
+            rule.error_data = str(e)
             return False
     
-    def check_all(self, accept_repairs=False):
+    def validate_all(self):
         """Validate all rules and return categorized lists."""
         valid = []
         broken = []
-        repaired = []
         
         for rule in self.rules:
-            self._validate_rule(rule, accept_repairs)
-            
-            if rule.status == YaraRule.STATUS_VALID:
+            if self.validate_rule(rule):
                 valid.append(rule)
-            elif rule.status == YaraRule.STATUS_REPAIRED:
-                repaired.append(rule)
             else:
                 broken.append(rule)
         
-        return valid, broken, repaired
+        return valid, broken
     
-    def clear_tmp(self):
-        """Clean up temporary directory."""
-        try:
-            if os.path.exists(self.tmp_dir):
-                shutil.rmtree(self.tmp_dir)
-        except Exception as e:
-            print(f"Warning: Could not clear temp directory: {e}", file=sys.stderr)
-    
-    def __del__(self):
-        if self.auto_clear:
-            self.clear_tmp()
+    def get_duplicate_rules(self):
+        """Get all duplicate rule names."""
+        duplicates = {}
+        for rule_name, rule_list in self.rule_names.items():
+            if len(rule_list) > 1:
+                duplicates[rule_name] = rule_list
+        return duplicates
 
+
+# ============================================================================
+# FILE I/O OPERATIONS
+# ============================================================================
 
 def collect_yara_files(directory, extensions=None):
     """Collect all YARA rule files from a directory."""
@@ -503,16 +358,81 @@ def collect_yara_files(directory, extensions=None):
     return sorted(set(yara_files))
 
 
-def write_rules_to_directory(rules, output_dir, use_repaired=False):
-    """Write rules to an output directory using rule names as filenames."""
+def write_valid_files(yara_files, output_dir):
+    """Write valid YARA files to output directory, preserving filenames."""
     os.makedirs(output_dir, exist_ok=True)
-    
     written_files = []
-    rule_name_counts = {}  # Track duplicate rule names
+    
+    for yara_file in yara_files:
+        output_path = os.path.join(output_dir, yara_file.filename)
+        
+        # Handle duplicate filenames
+        counter = 1
+        base_name = Path(yara_file.filename).stem
+        ext = Path(yara_file.filename).suffix
+        while os.path.exists(output_path):
+            output_path = os.path.join(output_dir, f"{base_name}_{counter}{ext}")
+            counter += 1
+        
+        # Add validation header
+        header = f"// Validated: {datetime.now().isoformat()}\n"
+        header += f"// Source: {yara_file.filepath}\n"
+        header += f"// Rules: {yara_file.rule_count}\n"
+        header += f"// Status: {yara_file.status.upper()}\n\n"
+        
+        try:
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(header)
+                f.write(yara_file.content)
+            written_files.append(output_path)
+        except Exception as e:
+            print(f"Error writing {output_path}: {e}", file=sys.stderr)
+    
+    return written_files
+
+
+def write_failed_files(yara_files, output_dir):
+    """Write failed YARA files to output directory with error info."""
+    os.makedirs(output_dir, exist_ok=True)
+    written_files = []
+    
+    for yara_file in yara_files:
+        output_path = os.path.join(output_dir, yara_file.filename)
+        
+        # Handle duplicate filenames
+        counter = 1
+        base_name = Path(yara_file.filename).stem
+        ext = Path(yara_file.filename).suffix
+        while os.path.exists(output_path):
+            output_path = os.path.join(output_dir, f"{base_name}_{counter}{ext}")
+            counter += 1
+        
+        # Add error header
+        header = f"// VALIDATION FAILED\n"
+        header += f"// Source: {yara_file.filepath}\n"
+        header += f"// Rules: {yara_file.rule_count}\n"
+        header += f"// Error: {yara_file.error_data}\n"
+        header += f"// Timestamp: {datetime.now().isoformat()}\n\n"
+        
+        try:
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(header)
+                f.write(yara_file.content)
+            written_files.append(output_path)
+        except Exception as e:
+            print(f"Error writing {output_path}: {e}", file=sys.stderr)
+    
+    return written_files
+
+
+def write_valid_rules(rules, output_dir):
+    """Write valid rules to output directory as individual files."""
+    os.makedirs(output_dir, exist_ok=True)
+    written_files = []
+    rule_name_counts = {}
     
     for rule in rules:
-        # Use rule name for filename
-        base_filename = rule.rule_name if rule.rule_name else "unknown_rule"
+        base_filename = rule.rule_name
         
         # Handle duplicate rule names
         if base_filename in rule_name_counts:
@@ -524,16 +444,12 @@ def write_rules_to_directory(rules, output_dir, use_repaired=False):
         
         output_path = os.path.join(output_dir, output_filename)
         
-        # Write the rule source with imports
-        source_to_write = rule.repaired_source if (use_repaired and rule.repaired_source) else rule.source
+        # Get full source with imports
+        full_source = rule.get_full_source()
         
-        # Include imports in the output
-        full_source = f"{rule.imports}\n\n{source_to_write}" if rule.imports else source_to_write
-        
-        # Add header comment
+        # Add header
         header = f"// Rule: {rule.rule_name}\n"
-        if rule.path:
-            header += f"// Source: {rule.path}\n"
+        header += f"// Source: {rule.source_file}\n"
         header += f"// Validated: {datetime.now().isoformat()}\n\n"
         
         try:
@@ -547,15 +463,14 @@ def write_rules_to_directory(rules, output_dir, use_repaired=False):
     return written_files
 
 
-def write_failed_rules_to_directory(rules, output_dir):
-    """Write failed rules to directory with error information."""
+def write_failed_rules(rules, output_dir):
+    """Write failed rules to output directory with error info."""
     os.makedirs(output_dir, exist_ok=True)
-    
     written_files = []
     rule_name_counts = {}
     
     for rule in rules:
-        base_filename = rule.rule_name if rule.rule_name else "unknown_rule"
+        base_filename = rule.rule_name
         
         # Handle duplicate rule names
         if base_filename in rule_name_counts:
@@ -567,14 +482,13 @@ def write_failed_rules_to_directory(rules, output_dir):
         
         output_path = os.path.join(output_dir, output_filename)
         
-        # Include imports in the output
-        full_source = f"{rule.imports}\n\n{rule.source}" if rule.imports else rule.source
+        # Get full source with imports
+        full_source = rule.get_full_source()
         
-        # Add header with error information
+        # Add error header
         header = f"// VALIDATION FAILED\n"
         header += f"// Rule: {rule.rule_name}\n"
-        if rule.path:
-            header += f"// Source: {rule.path}\n"
+        header += f"// Source: {rule.source_file}\n"
         header += f"// Error: {rule.error_data}\n"
         header += f"// Timestamp: {datetime.now().isoformat()}\n\n"
         
@@ -589,54 +503,38 @@ def write_failed_rules_to_directory(rules, output_dir):
     return written_files
 
 
-def write_combined_rules(rules, output_file, use_repaired=False):
-    """Write all rules to a single combined file."""
-    os.makedirs(os.path.dirname(output_file) if os.path.dirname(output_file) else '.', exist_ok=True)
-    
-    # Collect all unique imports
-    all_imports = set()
-    for rule in rules:
-        if rule.imports:
-            for import_line in rule.imports.split('\n'):
-                if import_line.strip():
-                    all_imports.add(import_line.strip())
-    
-    with open(output_file, 'w', encoding='utf-8') as f:
-        f.write(f"// Combined YARA Rules\n")
-        f.write(f"// Generated: {datetime.now().isoformat()}\n")
-        f.write(f"// Total rules: {len(rules)}\n\n")
-        
-        # Write imports at the top
-        if all_imports:
-            f.write("// Global Imports\n")
-            for import_stmt in sorted(all_imports):
-                f.write(f"{import_stmt}\n")
-            f.write("\n")
-        
-        # Write rules
-        for rule in rules:
-            source_to_write = rule.repaired_source if (use_repaired and rule.repaired_source) else rule.source
-            
-            f.write(f"// Rule: {rule.rule_name}\n")
-            f.write(f"// Source: {rule.path if rule.path else 'inline'}\n")
-            f.write(source_to_write)
-            f.write("\n\n")
+# ============================================================================
+# REPORTING
+# ============================================================================
 
-
-def generate_json_report(valid, broken, repaired, output_file):
-    """Generate a JSON report of validation results."""
+def generate_file_json_report(valid_files, broken_files, duplicates, output_file):
+    """Generate JSON report for file-level validation."""
+    total = len(valid_files) + len(broken_files)
+    total_rules = sum(f.rule_count for f in valid_files + broken_files)
+    
+    # Format duplicates for JSON
+    duplicates_list = []
+    for rule_name, file_list in duplicates.items():
+        duplicates_list.append({
+            'rule_name': rule_name,
+            'count': len(file_list),
+            'files': file_list
+        })
+    
     report = {
         'timestamp': datetime.now().isoformat(),
+        'mode': 'file',
         'summary': {
-            'total': len(valid) + len(broken) + len(repaired),
-            'valid': len(valid),
-            'broken': len(broken),
-            'repaired': len(repaired),
-            'success_rate': round((len(valid) + len(repaired)) / (len(valid) + len(broken) + len(repaired)) * 100, 2) if (len(valid) + len(broken) + len(repaired)) > 0 else 0
+            'total_files': total,
+            'valid_files': len(valid_files),
+            'broken_files': len(broken_files),
+            'total_rules': total_rules,
+            'duplicate_rules': len(duplicates),
+            'success_rate': round(len(valid_files) / total * 100, 2) if total > 0 else 0
         },
-        'valid_rules': [rule.to_dict() for rule in valid],
-        'broken_rules': [rule.to_dict() for rule in broken],
-        'repaired_rules': [rule.to_dict() for rule in repaired]
+        'duplicates': duplicates_list,
+        'valid_files': [f.to_dict() for f in valid_files],
+        'broken_files': [f.to_dict() for f in broken_files]
     }
     
     os.makedirs(os.path.dirname(output_file) if os.path.dirname(output_file) else '.', exist_ok=True)
@@ -646,139 +544,214 @@ def generate_json_report(valid, broken, repaired, output_file):
     return report
 
 
-def generate_markdown_report(valid, broken, repaired, output_file):
-    """Generate a Markdown report for GitLab/GitHub."""
+def generate_rule_json_report(valid_rules, broken_rules, duplicates, output_file):
+    """Generate JSON report for rule-level validation."""
+    total = len(valid_rules) + len(broken_rules)
+    
+    # Format duplicates for JSON
+    duplicates_list = []
+    for rule_name, rule_list in duplicates.items():
+        duplicates_list.append({
+            'rule_name': rule_name,
+            'count': len(rule_list),
+            'source_files': [r.source_file for r in rule_list]
+        })
+    
+    report = {
+        'timestamp': datetime.now().isoformat(),
+        'mode': 'split',
+        'summary': {
+            'total_rules': total,
+            'valid_rules': len(valid_rules),
+            'broken_rules': len(broken_rules),
+            'duplicate_rules': len(duplicates),
+            'success_rate': round(len(valid_rules) / total * 100, 2) if total > 0 else 0
+        },
+        'duplicates': duplicates_list,
+        'valid_rules': [r.to_dict() for r in valid_rules],
+        'broken_rules': [r.to_dict() for r in broken_rules]
+    }
+    
+    os.makedirs(os.path.dirname(output_file) if os.path.dirname(output_file) else '.', exist_ok=True)
     with open(output_file, 'w', encoding='utf-8') as f:
-        f.write("# YARA Rule Validation Report\n\n")
-        f.write(f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        json.dump(report, f, indent=2)
+    
+    return report
+
+
+def generate_file_markdown_report(valid_files, broken_files, duplicates, output_file):
+    """Generate Markdown report for file-level validation."""
+    with open(output_file, 'w', encoding='utf-8') as f:
+        f.write("# YARA File Validation Report\n\n")
+        f.write(f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"**Mode:** File-level validation\n\n")
         
         # Summary
-        total = len(valid) + len(broken) + len(repaired)
-        success_rate = round((len(valid) + len(repaired)) / total * 100, 2) if total > 0 else 0
+        total = len(valid_files) + len(broken_files)
+        total_rules = sum(file.rule_count for file in valid_files + broken_files)
+        success_rate = round(len(valid_files) / total * 100, 2) if total > 0 else 0
+        
+        f.write("## Summary\n\n")
+        f.write(f"| Metric | Count |\n")
+        f.write(f"|--------|-------|\n")
+        f.write(f"| Total Files | {total} |\n")
+        f.write(f"| ✅ Valid Files | {len(valid_files)} |\n")
+        f.write(f"| ❌ Broken Files | {len(broken_files)} |\n")
+        f.write(f"| Total Rules | {total_rules} |\n")
+        f.write(f"| ⚠️ Duplicate Rule Names | {len(duplicates)} |\n")
+        f.write(f"| Success Rate | {success_rate}% |\n\n")
+        
+        # Status
+        if len(broken_files) == 0 and len(duplicates) == 0:
+            f.write("**Status:** ✅ All files validated successfully, no duplicates found\n\n")
+        elif len(broken_files) > 0 and len(duplicates) > 0:
+            f.write(f"**Status:** ⚠️ {len(broken_files)} file(s) failed validation AND {len(duplicates)} duplicate rule name(s) found\n\n")
+        elif len(broken_files) > 0:
+            f.write(f"**Status:** ⚠️ {len(broken_files)} file(s) failed validation\n\n")
+        else:
+            f.write(f"**Status:** ⚠️ {len(duplicates)} duplicate rule name(s) found\n\n")
+        
+        # Duplicate rules warning
+        if duplicates:
+            f.write("## ⚠️ Duplicate Rule Names\n\n")
+            f.write("**CRITICAL:** YARA requires all rule names to be unique across all loaded files.\n")
+            f.write("The following rule names appear in multiple files and must be renamed:\n\n")
+            
+            for rule_name, file_list in sorted(duplicates.items()):
+                f.write(f"### ⚠️ `{rule_name}` (appears in {len(file_list)} files)\n\n")
+                for filepath in file_list:
+                    f.write(f"- `{filepath}`\n")
+                f.write("\n")
+            
+            f.write("**💡 Recommendation:** Add a prefix or suffix to make rule names unique.\n")
+            f.write("- Example: `MalwareRule` → `Vendor_MalwareRule` or `MalwareRule_v1`\n\n")
+            f.write("---\n\n")
+        
+        # Valid files
+        if valid_files:
+            f.write("## ✅ Valid Files\n\n")
+            for file in valid_files:
+                f.write(f"- **{file.filename}** ({file.rule_count} rule(s)) - `{file.filepath}`\n")
+            f.write("\n")
+        
+        # Broken files
+        if broken_files:
+            f.write("## ❌ Broken Files\n\n")
+            for i, file in enumerate(broken_files, 1):
+                f.write(f"### {i}. {file.filename}\n\n")
+                f.write(f"- **Path:** `{file.filepath}`\n")
+                f.write(f"- **Rules:** {file.rule_count}\n")
+                f.write(f"- **Error:**\n")
+                f.write("```\n")
+                f.write(f"{file.error_data}\n")
+                f.write("```\n\n")
+                
+                # Show first 20 lines of content
+                if file.content:
+                    f.write("<details>\n")
+                    f.write("<summary>View file content (first 20 lines)</summary>\n\n")
+                    f.write("```yara\n")
+                    lines = file.content.split('\n')
+                    for line_num, line in enumerate(lines[:20], 1):
+                        f.write(f"{line_num:4d}: {line}\n")
+                    if len(lines) > 20:
+                        f.write(f"... ({len(lines) - 20} more lines)\n")
+                    f.write("```\n")
+                    f.write("</details>\n\n")
+                
+                f.write("---\n\n")
+
+
+def generate_rule_markdown_report(valid_rules, broken_rules, duplicates, output_file):
+    """Generate Markdown report for rule-level validation."""
+    with open(output_file, 'w', encoding='utf-8') as f:
+        f.write("# YARA Rule Validation Report\n\n")
+        f.write(f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"**Mode:** Split-rule validation\n\n")
+        
+        # Summary
+        total = len(valid_rules) + len(broken_rules)
+        success_rate = round(len(valid_rules) / total * 100, 2) if total > 0 else 0
         
         f.write("## Summary\n\n")
         f.write(f"| Metric | Count |\n")
         f.write(f"|--------|-------|\n")
         f.write(f"| Total Rules | {total} |\n")
-        f.write(f"| ✅ Valid Rules | {len(valid)} |\n")
-        f.write(f"| ❌ Broken Rules | {len(broken)} |\n")
-        f.write(f"| 🔧 Repaired Rules | {len(repaired)} |\n")
+        f.write(f"| ✅ Valid Rules | {len(valid_rules)} |\n")
+        f.write(f"| ❌ Broken Rules | {len(broken_rules)} |\n")
+        f.write(f"| ⚠️ Duplicate Rule Names | {len(duplicates)} |\n")
         f.write(f"| Success Rate | {success_rate}% |\n\n")
         
-        # Status badge
-        if len(broken) == 0:
-            f.write("**Status:** ✅ All rules validated successfully\n\n")
+        # Status
+        if len(broken_rules) == 0 and len(duplicates) == 0:
+            f.write("**Status:** ✅ All rules validated successfully, no duplicates found\n\n")
+        elif len(broken_rules) > 0 and len(duplicates) > 0:
+            f.write(f"**Status:** ⚠️ {len(broken_rules)} rule(s) failed validation AND {len(duplicates)} duplicate rule name(s) found\n\n")
+        elif len(broken_rules) > 0:
+            f.write(f"**Status:** ⚠️ {len(broken_rules)} rule(s) failed validation\n\n")
         else:
-            f.write(f"**Status:** ⚠️ {len(broken)} rule(s) failed validation\n\n")
+            f.write(f"**Status:** ⚠️ {len(duplicates)} duplicate rule name(s) found\n\n")
+        
+        # Duplicate rules warning
+        if duplicates:
+            f.write("## ⚠️ Duplicate Rule Names\n\n")
+            f.write("**CRITICAL:** YARA requires all rule names to be unique across all loaded files.\n")
+            f.write("The following rule names appear multiple times and must be renamed:\n\n")
+            
+            for rule_name, rule_list in sorted(duplicates.items()):
+                f.write(f"### ⚠️ `{rule_name}` (appears {len(rule_list)} times)\n\n")
+                for rule in rule_list:
+                    f.write(f"- `{rule.source_file}`\n")
+                f.write("\n")
+            
+            f.write("**💡 Recommendation:** Add a prefix or suffix to make rule names unique.\n")
+            f.write("- Example: `MalwareRule` → `Vendor_MalwareRule` or `MalwareRule_v1`\n\n")
+            f.write("---\n\n")
         
         # Valid rules
-        if valid:
+        if valid_rules:
             f.write("## ✅ Valid Rules\n\n")
-            for rule in valid:
-                source_file = rule.path if rule.path else "inline"
-                f.write(f"- **{rule.rule_name}** (`{source_file}`)\n")
+            for rule in valid_rules:
+                f.write(f"- **{rule.rule_name}** - `{rule.source_file}`\n")
             f.write("\n")
         
-        # Repaired rules
-        if repaired:
-            f.write("## 🔧 Repaired Rules\n\n")
-            for rule in repaired:
-                source_file = rule.path if rule.path else "inline"
-                f.write(f"### **{rule.rule_name}** (`{source_file}`)\n\n")
-                f.write(f"**Repair Applied:** {rule.error_data}\n\n")
-                f.write("<details>\n")
-                f.write("<summary>View repaired source</summary>\n\n")
-                f.write("```yara\n")
-                # Show repaired source with imports
-                full_source = f"{rule.imports}\n\n{rule.repaired_source}" if rule.imports and rule.repaired_source else (rule.repaired_source or "")
-                lines = full_source.split('\n')
-                for line in lines[:30]:
-                    f.write(f"{line}\n")
-                if len(lines) > 30:
-                    f.write(f"... ({len(lines) - 30} more lines)\n")
-                f.write("```\n")
-                f.write("</details>\n\n")
-            f.write("\n")
-        
-        # Broken rules with detailed error information
-        if broken:
-            f.write("## ❌ Broken Rules - Detailed Error Report\n\n")
-            for i, rule in enumerate(broken, 1):
-                source_file = rule.path if rule.path else "inline"
-                f.write(f"### {i}. **{rule.rule_name}** (`{source_file}`)\n\n")
-                
-                # Error message
-                f.write(f"**Validation Error:**\n")
+        # Broken rules
+        if broken_rules:
+            f.write("## ❌ Broken Rules\n\n")
+            for i, rule in enumerate(broken_rules, 1):
+                f.write(f"### {i}. {rule.rule_name}\n\n")
+                f.write(f"- **Source:** `{rule.source_file}`\n")
+                f.write(f"- **Error:**\n")
                 f.write("```\n")
                 f.write(f"{rule.error_data}\n")
                 f.write("```\n\n")
                 
-                # Parse error for line number if available
-                line_match = re.search(r'line (\d+)', rule.error_data)
-                error_line = int(line_match.group(1)) if line_match else None
-                
-                # Show rule source with context
+                # Show rule source
                 f.write("<details>\n")
                 f.write("<summary>View rule source</summary>\n\n")
                 f.write("```yara\n")
-                
-                # Get full source with imports
                 full_source = rule.get_full_source()
                 lines = full_source.split('\n')
-                
-                # If we know the error line, show context around it
-                if error_line and error_line <= len(lines):
-                    start = max(0, error_line - 10)
-                    end = min(len(lines), error_line + 10)
-                    
-                    for line_num in range(start, end):
-                        line = lines[line_num]
-                        # Mark the error line
-                        if line_num + 1 == error_line:
-                            f.write(f"{line_num + 1:4d}: >>> {line} <<<  ⚠️ ERROR HERE\n")
-                        else:
-                            f.write(f"{line_num + 1:4d}: {line}\n")
-                    
-                    if end < len(lines):
-                        f.write(f"... ({len(lines) - end} more lines)\n")
-                else:
-                    # Show first 30 lines if no specific error line
-                    for line_num, line in enumerate(lines[:30], 1):
-                        f.write(f"{line_num:4d}: {line}\n")
-                    if len(lines) > 30:
-                        f.write(f"... ({len(lines) - 30} more lines)\n")
-                
+                for line_num, line in enumerate(lines[:30], 1):
+                    f.write(f"{line_num:4d}: {line}\n")
+                if len(lines) > 30:
+                    f.write(f"... ({len(lines) - 30} more lines)\n")
                 f.write("```\n")
                 f.write("</details>\n\n")
-                
-                # Possible fix suggestions
-                if "syntax error" in rule.error_data.lower():
-                    f.write("**💡 Possible fixes:**\n")
-                    f.write("- Check for missing or extra braces `{}`\n")
-                    f.write("- Verify the `condition:` section syntax\n")
-                    f.write("- Ensure all strings in `strings:` section are properly formatted\n")
-                    f.write("- Check for missing colons after `meta:`, `strings:`, or `condition:`\n\n")
-                elif "undefined" in rule.error_data.lower():
-                    f.write("**💡 Possible fixes:**\n")
-                    f.write("- Check that all variables referenced in condition are defined in strings section\n")
-                    f.write("- Verify spelling of variable names\n")
-                    f.write("- Ensure required imports are present (e.g., `import \"pe\"` for PE module functions)\n\n")
-                elif "duplicated" in rule.error_data.lower():
-                    f.write("**💡 Possible fixes:**\n")
-                    f.write("- Rename duplicate rule or identifier\n")
-                    f.write("- Check for conflicting imports\n\n")
                 
                 f.write("---\n\n")
 
 
-def validate_directory_cicd(directory, accept_repairs=False, verbose=False,
-                            output_valid_dir=None, output_valid_combined=None,
-                            output_failed_dir=None, json_report=None,
-                            markdown_report=None, namespace=None):
-    """Validate YARA rules with CI/CD-friendly outputs."""
+# ============================================================================
+# MAIN VALIDATION WORKFLOWS
+# ============================================================================
+
+def validate_files_mode(directory, verbose=False, output_valid_dir=None, 
+                       output_failed_dir=None, json_report=None, markdown_report=None):
+    """Validate entire files (default mode)."""
     
     print("="*80)
-    print("YARA Rule Validation for CI/CD (Improved Multi-Rule File Support)")
+    print("YARA File Validator - FILE MODE")
     print("="*80)
     print(f"Directory: {os.path.abspath(directory)}")
     try:
@@ -787,189 +760,330 @@ def validate_directory_cicd(directory, accept_repairs=False, verbose=False,
         print("YARA Version: Unknown")
     print("="*80)
     
-    # Collect YARA files
+    # Collect files
     yara_files = collect_yara_files(directory)
     
     if not yara_files:
         print(f"\n❌ No YARA rule files found in {directory}")
-        return 0, 0, 0
+        return 0, 0
     
     print(f"\n📁 Found {len(yara_files)} YARA file(s)")
     
     # Initialize validator
-    validator = YaraValidator(auto_clear=False)
+    validator = FileValidator()
     
-    # Add all rule files (this will parse multiple rules per file)
-    print("\n📥 Loading and parsing rules...")
-    total_rules_loaded = 0
-    for yara_file in yara_files:
+    # Add files
+    print("\n📥 Loading files...")
+    for filepath in yara_files:
         try:
-            include_name = os.path.basename(yara_file)
-            rule_namespace = namespace if namespace else os.path.dirname(yara_file)
-            
-            rules_before = len(validator.rules)
-            validator.add_rule_file(yara_file, namespace=rule_namespace, include_name=include_name)
-            rules_after = len(validator.rules)
-            rules_in_file = rules_after - rules_before
-            
-            total_rules_loaded += rules_in_file
-            
+            validator.add_file(filepath)
             if verbose:
-                print(f"  ✓ Loaded {rules_in_file} rule(s) from: {yara_file}")
+                print(f"  ✓ Loaded: {filepath}")
         except Exception as e:
-            print(f"  ✗ Error loading {yara_file}: {e}")
+            print(f"  ✗ Error loading {filepath}: {e}")
     
-    print(f"\n📊 Total rules parsed: {total_rules_loaded}")
+    # Validate
+    print("\n🔍 Validating files...")
+    valid_files, broken_files = validator.validate_all()
     
-    # Validate all rules
-    print("\n🔍 Validating rules...")
-    valid, broken, repaired = validator.check_all(accept_repairs=accept_repairs)
+    # Check for duplicate rule names
+    duplicates = validator.get_duplicate_rules()
+    
+    # Calculate total rules
+    total_rules = sum(f.rule_count for f in valid_files + broken_files)
     
     # Print summary
     print("\n" + "="*80)
     print("VALIDATION RESULTS")
     print("="*80)
-    print(f"✅ Valid rules:    {len(valid)}")
-    print(f"❌ Broken rules:   {len(broken)}")
-    print(f"🔧 Repaired rules: {len(repaired)}")
+    print(f"✅ Valid files:   {len(valid_files)}")
+    print(f"❌ Broken files:  {len(broken_files)}")
+    print(f"📊 Total rules:   {total_rules}")
+    
+    # Report duplicate rule names
+    if duplicates:
+        print(f"⚠️  Duplicate rule names found: {len(duplicates)}")
+    
     print("="*80)
     
-    # Print detailed results if verbose
+    # Print duplicate details
+    if duplicates:
+        print("\n" + "="*80)
+        print(f"⚠️  DUPLICATE RULE NAMES DETECTED ({len(duplicates)} conflicts)")
+        print("="*80)
+        print("\nYARA requires all rule names to be unique across all loaded files.")
+        print("Please rename the following duplicate rules:\n")
+        
+        for rule_name, file_list in sorted(duplicates.items()):
+            print(f"  ⚠️  Rule '{rule_name}' appears in {len(file_list)} files:")
+            for filepath in file_list:
+                print(f"      - {filepath}")
+            print()
+        
+        print("="*80)
+        print("💡 TIP: Add a prefix or suffix to make rule names unique")
+        print("    Example: 'MalwareRule' → 'Vendor_MalwareRule' or 'MalwareRule_v1'")
+        print("="*80)
+    
+    # Print details if verbose
     if verbose:
-        if valid:
-            print(f"\n{'='*25} VALID RULES ({len(valid)}) {'='*25}")
-            for rule in valid:
-                source_info = f"{rule.path} -> {rule.rule_name}" if rule.path else rule.rule_name
-                print(f"  ✓ {source_info}")
+        if valid_files:
+            print(f"\n{'='*25} VALID FILES ({len(valid_files)}) {'='*25}")
+            for file in valid_files:
+                print(f"  ✓ {file.filename} ({file.rule_count} rules)")
         
-        if repaired:
-            print(f"\n{'='*25} REPAIRED RULES ({len(repaired)}) {'='*25}")
-            for rule in repaired:
-                source_info = f"{rule.path} -> {rule.rule_name}" if rule.path else rule.rule_name
-                print(f"  🔧 {source_info}")
-                print(f"     Repair: {rule.error_data}")
-        
-        if broken:
-            print(f"\n{'='*25} BROKEN RULES ({len(broken)}) {'='*25}")
-            for rule in broken:
-                source_info = f"{rule.path} -> {rule.rule_name}" if rule.path else rule.rule_name
-                print(f"  ❌ {source_info}")
-                print(f"     Error: {rule.error_data}")
-                # Show first few lines of the rule for context
-                lines = rule.source.split('\n')
-                print(f"     Source preview (first 5 lines):")
-                for i, line in enumerate(lines[:5], 1):
-                    print(f"       {i:2d}: {line}")
-                if len(lines) > 5:
-                    print(f"       ... ({len(lines) - 5} more lines)")
+        if broken_files:
+            print(f"\n{'='*25} BROKEN FILES ({len(broken_files)}) {'='*25}")
+            for file in broken_files:
+                print(f"  ❌ {file.filename} ({file.rule_count} rules)")
+                print(f"     Error: {file.error_data[:100]}...")
                 print()
     
     # Write outputs
-    if output_valid_dir:
-        print(f"\n📝 Writing valid rules to directory: {output_valid_dir}")
-        written = write_rules_to_directory(valid, output_valid_dir, use_repaired=False)
+    if output_valid_dir and valid_files:
+        print(f"\n📝 Writing valid files to: {output_valid_dir}")
+        written = write_valid_files(valid_files, output_valid_dir)
         print(f"   Wrote {len(written)} file(s)")
-        
-        if repaired:
-            print(f"\n📝 Writing repaired rules to directory: {output_valid_dir}")
-            written_repaired = write_rules_to_directory(repaired, output_valid_dir, use_repaired=True)
-            print(f"   Wrote {len(written_repaired)} repaired file(s)")
     
-    if output_valid_combined:
-        print(f"\n📝 Writing combined valid rules to: {output_valid_combined}")
-        all_valid = valid + repaired
-        write_combined_rules(all_valid, output_valid_combined, use_repaired=True)
-        print(f"   Wrote {len(all_valid)} rule(s)")
-    
-    if output_failed_dir and broken:
-        print(f"\n📝 Writing failed rules to directory: {output_failed_dir}")
-        written = write_failed_rules_to_directory(broken, output_failed_dir)
-        print(f"   Wrote {len(written)} file(s) with error information")
+    if output_failed_dir and broken_files:
+        print(f"\n📝 Writing failed files to: {output_failed_dir}")
+        written = write_failed_files(broken_files, output_failed_dir)
+        print(f"   Wrote {len(written)} file(s)")
     
     if json_report:
         print(f"\n📝 Generating JSON report: {json_report}")
-        report_data = generate_json_report(valid, broken, repaired, json_report)
+        generate_file_json_report(valid_files, broken_files, duplicates, json_report)
     
     if markdown_report:
         print(f"\n📝 Generating Markdown report: {markdown_report}")
-        generate_markdown_report(valid, broken, repaired, markdown_report)
-    
-    # Cleanup
-    validator.clear_tmp()
+        generate_file_markdown_report(valid_files, broken_files, duplicates, markdown_report)
     
     print("\n" + "="*80)
-    if broken:
-        print(f"⚠️  Validation completed with {len(broken)} failure(s)")
+    if broken_files:
+        print(f"⚠️  Validation completed with {len(broken_files)} file failure(s)")
     else:
-        print("✅ Validation completed successfully!")
+        print("✅ All files validated successfully!")
     print("="*80)
     
-    return len(valid), len(broken), len(repaired)
+    return len(valid_files), len(broken_files)
 
+
+def validate_split_mode(directory, verbose=False, output_valid_dir=None,
+                       output_failed_dir=None, json_report=None, markdown_report=None):
+    """Validate individual rules (split mode)."""
+    
+    print("="*80)
+    print("YARA Rule Validator - SPLIT MODE")
+    print("="*80)
+    print(f"Directory: {os.path.abspath(directory)}")
+    try:
+        print(f"YARA Version: {yara.__version__}")
+    except:
+        print("YARA Version: Unknown")
+    print("="*80)
+    
+    # Collect files
+    yara_files = collect_yara_files(directory)
+    
+    if not yara_files:
+        print(f"\n❌ No YARA rule files found in {directory}")
+        return 0, 0
+    
+    print(f"\n📁 Found {len(yara_files)} YARA file(s)")
+    
+    # Initialize validator
+    validator = RuleValidator()
+    
+    # Parse and add rules
+    print("\n📥 Parsing rules from files...")
+    total_rules = 0
+    for filepath in yara_files:
+        try:
+            rule_count = validator.add_file(filepath)
+            total_rules += rule_count
+            if verbose:
+                print(f"  ✓ Parsed {rule_count} rule(s) from: {filepath}")
+        except Exception as e:
+            print(f"  ✗ Error parsing {filepath}: {e}")
+    
+    print(f"\n📊 Total rules parsed: {total_rules}")
+    
+    # Validate
+    print("\n🔍 Validating rules...")
+    valid_rules, broken_rules = validator.validate_all()
+    
+    # Check for duplicate rule names
+    duplicates = validator.get_duplicate_rules()
+    
+    # Print summary
+    print("\n" + "="*80)
+    print("VALIDATION RESULTS")
+    print("="*80)
+    print(f"✅ Valid rules:   {len(valid_rules)}")
+    print(f"❌ Broken rules:  {len(broken_rules)}")
+    
+    # Report duplicate rule names
+    if duplicates:
+        print(f"⚠️  Duplicate rule names found: {len(duplicates)}")
+    
+    print("="*80)
+    
+    # Print duplicate details
+    if duplicates:
+        print("\n" + "="*80)
+        print(f"⚠️  DUPLICATE RULE NAMES DETECTED ({len(duplicates)} conflicts)")
+        print("="*80)
+        print("\nYARA requires all rule names to be unique across all loaded files.")
+        print("Please rename the following duplicate rules:\n")
+        
+        for rule_name, rule_list in sorted(duplicates.items()):
+            print(f"  ⚠️  Rule '{rule_name}' appears {len(rule_list)} times:")
+            for rule in rule_list:
+                print(f"      - {rule.source_file}")
+            print()
+        
+        print("="*80)
+        print("💡 TIP: Add a prefix or suffix to make rule names unique")
+        print("    Example: 'MalwareRule' → 'Vendor_MalwareRule' or 'MalwareRule_v1'")
+        print("="*80)
+    
+    # Print details if verbose
+    if verbose:
+        if valid_rules:
+            print(f"\n{'='*25} VALID RULES ({len(valid_rules)}) {'='*25}")
+            for rule in valid_rules:
+                print(f"  ✓ {rule.rule_name} <- {os.path.basename(rule.source_file)}")
+        
+        if broken_rules:
+            print(f"\n{'='*25} BROKEN RULES ({len(broken_rules)}) {'='*25}")
+            for rule in broken_rules:
+                print(f"  ❌ {rule.rule_name} <- {os.path.basename(rule.source_file)}")
+                print(f"     Error: {rule.error_data[:100]}...")
+                print()
+    
+    # Write outputs
+    if output_valid_dir and valid_rules:
+        print(f"\n📝 Writing valid rules to: {output_valid_dir}")
+        written = write_valid_rules(valid_rules, output_valid_dir)
+        print(f"   Wrote {len(written)} file(s)")
+    
+    if output_failed_dir and broken_rules:
+        print(f"\n📝 Writing failed rules to: {output_failed_dir}")
+        written = write_failed_rules(broken_rules, output_failed_dir)
+        print(f"   Wrote {len(written)} file(s)")
+    
+    if json_report:
+        print(f"\n📝 Generating JSON report: {json_report}")
+        generate_rule_json_report(valid_rules, broken_rules, duplicates, json_report)
+    
+    if markdown_report:
+        print(f"\n📝 Generating Markdown report: {markdown_report}")
+        generate_rule_markdown_report(valid_rules, broken_rules, duplicates, markdown_report)
+    
+    print("\n" + "="*80)
+    if broken_rules:
+        print(f"⚠️  Validation completed with {len(broken_rules)} rule failure(s)")
+    else:
+        print("✅ All rules validated successfully!")
+    print("="*80)
+    
+    return len(valid_rules), len(broken_rules)
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
 
 def main():
-    """Main entry point for the script."""
+    """Main entry point."""
     parser = argparse.ArgumentParser(
-        description='Validate YARA rules for CI/CD pipelines (supports multi-rule files)',
+        description='YARA Rule Validator for CI/CD Pipelines',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Examples:
-  %(prog)s ./rules --output-valid-dir validated/
-  %(prog)s ./rules --output-valid-combined validated_rules.yar
-  %(prog)s ./rules --output-valid-dir validated/ --output-failed-dir failed/
-  %(prog)s ./rules --json-report report.json --markdown-report report.md
+OPERATION MODES:
+
+  FILE MODE (default):
+    Validates entire files as-is, preserving all rules, imports, and dependencies.
+    This is the recommended mode for most use cases.
+    
+    Example: python %(prog)s ./rules --output-valid-dir validated/
   
-Features:
-  - Parses multiple rules from single files using indentation-aware parsing
-  - Properly handles braces in strings (e.g., ".hacking{")
-  - Preserves and applies global import statements
-  - Outputs each rule as individual file named by rule name
-  - Validates each rule independently
+  SPLIT MODE (--split-rules):
+    Parses individual rules from files and validates each separately.
+    Useful for isolating issues in multi-rule files.
+    
+    Example: python %(prog)s ./rules --split-rules --output-valid-dir validated/
+
+EXAMPLES:
+
+  # Validate complete files (recommended)
+  python %(prog)s ./rules --output-valid-dir validated/
+  
+  # Validate files with detailed output
+  python %(prog)s ./rules --verbose --output-valid-dir validated/ --output-failed-dir failed/
+  
+  # Split and validate individual rules
+  python %(prog)s ./rules --split-rules --output-valid-dir validated/
+  
+  # Generate reports
+  python %(prog)s ./rules --json-report report.json --markdown-report report.md
         """
     )
     
-    parser.add_argument('directory', help='Directory containing YARA rule files')
-    parser.add_argument('--accept-repairs', action='store_true', 
-                       help='Attempt to repair broken rules')
-    parser.add_argument('--verbose', '-v', action='store_true', 
+    parser.add_argument('directory', 
+                       help='Directory containing YARA rule files')
+    
+    parser.add_argument('--split-rules', action='store_true',
+                       help='Parse and validate individual rules separately (split mode)')
+    
+    parser.add_argument('--verbose', '-v', action='store_true',
                        help='Show detailed output')
+    
     parser.add_argument('--output-valid-dir', metavar='DIR',
-                       help='Output directory for valid rules (one file per rule)')
-    parser.add_argument('--output-valid-combined', metavar='FILE',
-                       help='Output file for combined valid rules')
+                       help='Output directory for valid files/rules')
+    
     parser.add_argument('--output-failed-dir', metavar='DIR',
-                       help='Output directory for failed rules (one file per rule with error info)')
+                       help='Output directory for failed files/rules')
+    
     parser.add_argument('--json-report', metavar='FILE',
                        help='Generate JSON report')
+    
     parser.add_argument('--markdown-report', metavar='FILE',
                        help='Generate Markdown report')
-    parser.add_argument('--namespace', '-n', metavar='NAME',
-                       help='Namespace for all rules')
     
     args = parser.parse_args()
     
+    # Validate directory
     if not os.path.isdir(args.directory):
         print(f"❌ Error: Directory not found: {args.directory}", file=sys.stderr)
         sys.exit(1)
     
     try:
-        valid_count, broken_count, repaired_count = validate_directory_cicd(
-            args.directory,
-            accept_repairs=args.accept_repairs,
-            verbose=args.verbose,
-            output_valid_dir=args.output_valid_dir,
-            output_valid_combined=args.output_valid_combined,
-            output_failed_dir=args.output_failed_dir,
-            json_report=args.json_report,
-            markdown_report=args.markdown_report,
-            namespace=args.namespace
-        )
+        # Choose validation mode
+        if args.split_rules:
+            valid_count, broken_count = validate_split_mode(
+                args.directory,
+                verbose=args.verbose,
+                output_valid_dir=args.output_valid_dir,
+                output_failed_dir=args.output_failed_dir,
+                json_report=args.json_report,
+                markdown_report=args.markdown_report
+            )
+        else:
+            valid_count, broken_count = validate_files_mode(
+                args.directory,
+                verbose=args.verbose,
+                output_valid_dir=args.output_valid_dir,
+                output_failed_dir=args.output_failed_dir,
+                json_report=args.json_report,
+                markdown_report=args.markdown_report
+            )
         
-        # Exit with appropriate code
-        # 0 = success (all rules valid or repaired)
+        # Exit codes
+        # 0 = success (all valid)
         # 1 = validation failures
-        # 2 = no rules found or error
-        if valid_count == 0 and repaired_count == 0:
+        # 2 = no files/rules found
+        if valid_count == 0:
             sys.exit(2)
         elif broken_count > 0:
             sys.exit(1)
