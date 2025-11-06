@@ -79,42 +79,132 @@ class YaraRule:
 
 def extract_rule_name(rule_source):
     """Extract the rule name from rule source code."""
-    match = re.search(r'^\s*rule\s+(\w+)', rule_source, re.MULTILINE)
+    match = re.search(r'^\s*(?:private\s+|global\s+)?rule\s+(\w+)', rule_source, re.MULTILINE)
     if match:
         return match.group(1)
     return "unknown_rule"
 
 
-def count_braces_in_context(text):
+def remove_comments_and_strings(text):
     """
-    Count braces while ignoring those in strings, comments, and hex patterns.
-    Returns (open_count, close_count)
+    Remove comments and string literals from YARA code to avoid false positives
+    when counting braces. This is more robust than the previous approach.
     """
-    # Remove single-line comments
-    text_no_single_comments = re.sub(r'//.*?$', '', text, flags=re.MULTILINE)
+    result = []
+    i = 0
+    length = len(text)
     
-    # Remove multi-line comments
-    text_no_comments = re.sub(r'/\*.*?\*/', '', text_no_single_comments, flags=re.DOTALL)
+    while i < length:
+        # Check for single-line comment
+        if i < length - 1 and text[i:i+2] == '//':
+            # Skip until end of line
+            while i < length and text[i] != '\n':
+                i += 1
+            if i < length:
+                result.append('\n')  # Keep the newline
+                i += 1
+            continue
+        
+        # Check for multi-line comment
+        if i < length - 1 and text[i:i+2] == '/*':
+            # Skip until closing */
+            i += 2
+            while i < length - 1:
+                if text[i:i+2] == '*/':
+                    i += 2
+                    break
+                if text[i] == '\n':
+                    result.append('\n')  # Keep newlines for line counting
+                i += 1
+            continue
+        
+        # Check for double-quoted string
+        if text[i] == '"':
+            result.append(' ')  # Replace string with space
+            i += 1
+            while i < length:
+                if text[i] == '\\' and i + 1 < length:
+                    # Skip escaped character
+                    i += 2
+                    continue
+                if text[i] == '"':
+                    i += 1
+                    break
+                if text[i] == '\n':
+                    result.append('\n')  # Keep newlines
+                i += 1
+            continue
+        
+        # Check for single-quoted string (less common in YARA but possible)
+        if text[i] == "'":
+            result.append(' ')  # Replace string with space
+            i += 1
+            while i < length:
+                if text[i] == '\\' and i + 1 < length:
+                    # Skip escaped character
+                    i += 2
+                    continue
+                if text[i] == "'":
+                    i += 1
+                    break
+                if text[i] == '\n':
+                    result.append('\n')  # Keep newlines
+                i += 1
+            continue
+        
+        # Check for hex pattern like { 4D 5A 90 00 }
+        if text[i] == '{':
+            # Look ahead to see if this is a hex pattern
+            j = i + 1
+            is_hex_pattern = True
+            hex_chars = 0
+            
+            # Skip whitespace
+            while j < length and text[j] in ' \t\n\r':
+                j += 1
+            
+            # Check if next chars are hex digits
+            while j < length:
+                if text[j] in ' \t\n\r':
+                    j += 1
+                    continue
+                elif text[j] == '}':
+                    # Found closing brace after hex chars
+                    if hex_chars > 0:
+                        # This is a hex pattern, skip it
+                        result.append(' ')  # Replace with space
+                        i = j + 1
+                        is_hex_pattern = True
+                        break
+                    else:
+                        is_hex_pattern = False
+                        break
+                elif text[j] in '0123456789ABCDEFabcdef?':
+                    hex_chars += 1
+                    j += 1
+                    if hex_chars > 1:  # Need at least 2 chars for a hex byte
+                        # Skip to next whitespace or closing brace
+                        while j < length and text[j] not in ' \t\n\r}':
+                            j += 1
+                else:
+                    # Not a hex pattern
+                    is_hex_pattern = False
+                    break
+            
+            if is_hex_pattern and hex_chars > 0:
+                continue
+        
+        # Regular character
+        result.append(text[i])
+        i += 1
     
-    # Remove quoted strings (both single and double quotes)
-    # This handles escaped quotes as well
-    text_no_strings = re.sub(r'"(?:[^"\\]|\\.)*"', '""', text_no_comments)
-    text_no_strings = re.sub(r"'(?:[^'\\]|\\.)*'", "''", text_no_strings)
-    
-    # Remove hex patterns like { 4D 5A 90 00 }
-    # Hex patterns are sequences of hex digits (00-FF) with optional wildcards (?)
-    text_no_hex = re.sub(r'\{\s*(?:[0-9A-Fa-f?]{2}\s*)+\}', '', text_no_strings)
-    
-    # Now count braces
-    open_braces = text_no_hex.count('{')
-    close_braces = text_no_hex.count('}')
-    
-    return open_braces, close_braces
+    return ''.join(result)
 
 
-def parse_yara_file(filepath):
+def parse_yara_file_by_indentation(filepath):
     """
-    Parse a YARA file and extract individual rules with their imports.
+    Parse a YARA file and extract individual rules by tracking brace indentation.
+    This approach is more reliable for complex rules with braces in strings.
     
     Returns:
         tuple: (imports_string, list_of_rule_sources)
@@ -126,60 +216,127 @@ def parse_yara_file(filepath):
         print(f"Error reading file {filepath}: {e}", file=sys.stderr)
         return "", []
     
-    # Extract all import statements from the top of the file
-    import_lines = []
     lines = content.split('\n')
     
-    for line in lines:
+    # Extract imports from the beginning of the file
+    import_lines = []
+    content_start_idx = 0
+    
+    for i, line in enumerate(lines):
         stripped = line.strip()
         # Check if line is an import statement
         if re.match(r'^\s*import\s+"[^"]+"\s*$', line):
             import_lines.append(line)
+            content_start_idx = i + 1
         elif stripped and not stripped.startswith('//') and not stripped.startswith('/*'):
             # Stop at first non-import, non-comment, non-empty line
-            if not re.match(r'^\s*import\s+"[^"]+"\s*$', stripped):
-                break
+            break
     
     imports_string = '\n'.join(import_lines) if import_lines else ""
     
-    # Extract individual rules using regex
-    # Match: rule RuleName { ... } (handling nested braces)
+    # Now parse rules using indentation-aware brace matching
     rules = []
     
-    # Find all rule definitions
-    rule_pattern = r'(^\s*(?:private\s+|global\s+)?rule\s+\w+.*?^\})'
-    matches = re.finditer(rule_pattern, content, re.MULTILINE | re.DOTALL)
+    # Remove comments and strings for accurate brace matching
+    clean_content = remove_comments_and_strings(content)
+    clean_lines = clean_content.split('\n')
     
-    for match in matches:
-        rule_source = match.group(1)
-        # Clean up the rule source
-        rule_source = rule_source.strip()
+    i = content_start_idx
+    while i < len(lines):
+        line = lines[i]
+        clean_line = clean_lines[i] if i < len(clean_lines) else ""
+        stripped = line.strip()
         
-        # Verify it's a complete rule by counting braces IN CONTEXT
-        open_braces, close_braces = count_braces_in_context(rule_source)
-        
-        if open_braces == close_braces:
-            rules.append(rule_source)
-        elif open_braces > close_braces:
-            # Only add closing braces if truly needed
-            # This should rarely happen with proper regex matching
-            missing_braces = open_braces - close_braces
-            rule_source += '\n' + '}' * missing_braces
-            rules.append(rule_source)
-        # If close_braces > open_braces, something is wrong - skip this rule
+        # Look for rule definition
+        if re.match(r'^\s*(?:private\s+|global\s+)?rule\s+\w+', stripped):
+            # Found a rule start
+            rule_start = i
+            rule_lines = [line]
+            
+            # Find the opening brace and its indentation
+            opening_brace_indent = None
+            j = i
+            
+            # The opening brace might be on the same line or the next line
+            while j < len(clean_lines):
+                if '{' in clean_lines[j]:
+                    # Find the position of the opening brace
+                    brace_pos = clean_lines[j].index('{')
+                    # Calculate indentation (number of leading spaces/tabs)
+                    opening_brace_indent = len(lines[j]) - len(lines[j].lstrip())
+                    
+                    if j > i:
+                        # Opening brace is on a different line, include those lines
+                        for k in range(i + 1, j + 1):
+                            rule_lines.append(lines[k])
+                    
+                    j += 1
+                    break
+                else:
+                    if j > i:
+                        rule_lines.append(lines[j])
+                    j += 1
+            
+            if opening_brace_indent is None:
+                # No opening brace found, skip this rule
+                i += 1
+                continue
+            
+            # Now find the matching closing brace at the same indentation
+            brace_count = 1
+            found_closing = False
+            
+            while j < len(clean_lines) and brace_count > 0:
+                current_line = clean_lines[j]
+                original_line = lines[j]
+                
+                # Count braces in the clean line
+                for char in current_line:
+                    if char == '{':
+                        brace_count += 1
+                    elif char == '}':
+                        brace_count -= 1
+                        if brace_count == 0:
+                            # Found the matching closing brace
+                            rule_lines.append(original_line)
+                            found_closing = True
+                            break
+                
+                if not found_closing:
+                    rule_lines.append(original_line)
+                    j += 1
+                else:
+                    break
+            
+            if found_closing:
+                # We have a complete rule
+                rule_source = '\n'.join(rule_lines)
+                rules.append(rule_source.strip())
+                i = j + 1
+            else:
+                # Incomplete rule, skip it
+                i += 1
+        else:
+            i += 1
     
-    # If no rules found with the pattern, treat entire file as one rule
+    # If no rules found, treat entire file as one rule
     if not rules:
-        # Remove imports from content to get just the rule
-        content_without_imports = content
-        for import_line in import_lines:
-            content_without_imports = content_without_imports.replace(import_line, '', 1)
-        content_without_imports = content_without_imports.strip()
-        
+        content_without_imports = '\n'.join(lines[content_start_idx:]).strip()
         if content_without_imports:
             rules.append(content_without_imports)
     
     return imports_string, rules
+
+
+def parse_yara_file(filepath):
+    """
+    Parse a YARA file and extract individual rules with their imports.
+    Uses the improved indentation-based parsing.
+    
+    Returns:
+        tuple: (imports_string, list_of_rule_sources)
+    """
+    return parse_yara_file_by_indentation(filepath)
 
 
 class YaraValidator:
@@ -255,8 +412,11 @@ class YaraValidator:
             if repaired != source:
                 repairs.append("Added missing 'condition:' keyword")
         
-        # Fix missing braces - use context-aware counting
-        open_braces, close_braces = count_braces_in_context(repaired)
+        # Fix missing closing brace using the same logic
+        clean_repaired = remove_comments_and_strings(repaired)
+        open_braces = clean_repaired.count('{')
+        close_braces = clean_repaired.count('}')
+        
         if open_braces != close_braces:
             if open_braces > close_braces:
                 repaired += '\n}'
@@ -618,7 +778,7 @@ def validate_directory_cicd(directory, accept_repairs=False, verbose=False,
     """Validate YARA rules with CI/CD-friendly outputs."""
     
     print("="*80)
-    print("YARA Rule Validation for CI/CD (Multi-Rule File Support)")
+    print("YARA Rule Validation for CI/CD (Improved Multi-Rule File Support)")
     print("="*80)
     print(f"Directory: {os.path.abspath(directory)}")
     try:
@@ -760,7 +920,8 @@ Examples:
   %(prog)s ./rules --json-report report.json --markdown-report report.md
   
 Features:
-  - Parses multiple rules from single files
+  - Parses multiple rules from single files using indentation-aware parsing
+  - Properly handles braces in strings (e.g., ".hacking{")
   - Preserves and applies global import statements
   - Outputs each rule as individual file named by rule name
   - Validates each rule independently
