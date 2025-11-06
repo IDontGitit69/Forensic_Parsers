@@ -258,6 +258,7 @@ class YaraFile:
         self.status = self.STATUS_UNKNOWN
         self.error_data = None
         self.rule_count = 0
+        self.was_deduplicated = False
     
     def load_content(self):
         """Load file content if not already loaded."""
@@ -278,16 +279,20 @@ class YaraFile:
     
     def to_dict(self):
         """Convert to dictionary for JSON serialization."""
-        return {
+        result = {
             'filepath': self.filepath,
             'filename': self.filename,
             'status': self.status,
             'rule_count': self.rule_count,
             'error': self.error_data
         }
+        if self.was_deduplicated:
+            result['deduplicated'] = True
+        return result
     
     def __repr__(self):
-        return f"<YaraFile {self.filename} - {self.status} - {self.rule_count} rules>"
+        suffix = " (deduplicated)" if self.was_deduplicated else ""
+        return f"<YaraFile {self.filename} - {self.status} - {self.rule_count} rules{suffix}>"
 
 
 class YaraRule:
@@ -443,9 +448,11 @@ def parse_yara_file_to_rules(filepath):
 class FileValidator:
     """Validates complete YARA files."""
     
-    def __init__(self):
+    def __init__(self, enable_deduplication=False):
         self.files = []
         self.all_rule_names = {}  # Track rule names across all files: {rule_name: [file1, file2, ...]}
+        self.enable_deduplication = enable_deduplication
+        self.dedup_tracker = DeduplicationTracker() if enable_deduplication else None
     
     def add_file(self, filepath):
         """Add a YARA file for validation."""
@@ -462,6 +469,78 @@ class FileValidator:
         matches = rule_pattern.findall(yara_file.content)
         return matches
     
+    def _deduplicate_file_content(self, yara_file):
+        """
+        Deduplicate rules within a file's content.
+        Returns: (deduplicated_content, changed_flag)
+        """
+        if not self.enable_deduplication or not yara_file.content:
+            return yara_file.content, False
+        
+        # Parse the file into imports and individual rules
+        imports, rule_sources = parse_yara_file_to_rules(yara_file.filepath)
+        
+        kept_rules = []
+        changed = False
+        
+        for rule_source in rule_sources:
+            rule_name_match = re.search(r'(?i)^\s*(?:private\s+|global\s+)?rule\s+(\w+)', rule_source, re.MULTILINE)
+            if not rule_name_match:
+                kept_rules.append(rule_source)
+                continue
+            
+            rule_name = rule_name_match.group(1)
+            
+            # Register and check for duplicates
+            should_keep, new_name, duplicate_info = self.dedup_tracker.register_rule(
+                rule_name,
+                rule_source,
+                yara_file.filepath
+            )
+            
+            if not should_keep:
+                # True duplicate - skip it
+                changed = True
+                print(f"  🗑️  Removing duplicate: '{rule_name}' from {os.path.basename(yara_file.filepath)}")
+                continue
+            elif new_name:
+                # Name conflict - rename it in the source
+                changed = True
+                print(f"  🔄 Renaming: '{rule_name}' → '{new_name}' in {os.path.basename(yara_file.filepath)}")
+                
+                # Rename in the source
+                renamed_source = re.sub(
+                    r'(?i)(^\s*(?:private\s+|global\s+)?rule\s+)(\w+)',
+                    r'\g<1>' + new_name,
+                    rule_source,
+                    count=1,
+                    flags=re.MULTILINE
+                )
+                kept_rules.append(renamed_source)
+            else:
+                # Keep as-is
+                kept_rules.append(rule_source)
+        
+        # Reconstruct the file content
+        if changed:
+            # Add header comment about deduplication
+            header = "// This file has been processed for deduplication\n"
+            header += f"// Original: {yara_file.filepath}\n"
+            header += f"// Processed: {datetime.now().isoformat()}\n\n"
+            
+            new_content = header
+            
+            # Add imports
+            if imports:
+                new_content += imports + "\n\n"
+            
+            # Add rules
+            new_content += "\n\n".join(kept_rules)
+            
+            return new_content, True
+        else:
+            return yara_file.content, False
+    
     def validate_file(self, yara_file):
         """Validate a single YARA file."""
         try:
@@ -469,15 +548,25 @@ class FileValidator:
             content = yara_file.load_content()
             yara_file.count_rules()
             
-            # Extract rule names and track them
+            # Deduplicate if enabled
+            if self.enable_deduplication:
+                deduplicated_content, was_changed = self._deduplicate_file_content(yara_file)
+                if was_changed:
+                    # Update the file content with deduplicated version
+                    yara_file.content = deduplicated_content
+                    yara_file.was_deduplicated = True
+                    # Recount rules after deduplication
+                    yara_file.count_rules()
+            
+            # Extract rule names and track them (after any deduplication)
             rule_names = self._extract_rule_names_from_file(yara_file)
             for rule_name in rule_names:
                 if rule_name not in self.all_rule_names:
                     self.all_rule_names[rule_name] = []
                 self.all_rule_names[rule_name].append(yara_file.filepath)
             
-            # Validate by compiling
-            yara.compile(source=content)
+            # Validate by compiling (use potentially deduplicated content)
+            yara.compile(source=yara_file.content)
             yara_file.status = YaraFile.STATUS_VALID
             return True
             
@@ -510,6 +599,12 @@ class FileValidator:
             if len(file_list) > 1:
                 duplicates[rule_name] = file_list
         return duplicates
+    
+    def get_deduplication_report(self):
+        """Get detailed deduplication report."""
+        if not self.enable_deduplication or not self.dedup_tracker:
+            return None
+        return self.dedup_tracker
 
 
 class RuleValidator:
@@ -812,6 +907,181 @@ def generate_file_json_report(valid_files, broken_files, duplicates, output_file
         json.dump(report, f, indent=2)
     
     return report
+
+
+def generate_file_json_report_with_dedup(valid_files, broken_files, duplicates, dedup_data, output_file):
+    """Generate JSON report for file-level validation with deduplication data."""
+    total = len(valid_files) + len(broken_files)
+    total_rules = sum(f.rule_count for f in valid_files + broken_files)
+    
+    # Format duplicates for JSON
+    duplicates_list = []
+    for rule_name, file_list in duplicates.items():
+        duplicates_list.append({
+            'rule_name': rule_name,
+            'count': len(file_list),
+            'files': file_list
+        })
+    
+    report = {
+        'timestamp': datetime.now().isoformat(),
+        'mode': 'file',
+        'deduplication_enabled': dedup_data is not None,
+        'summary': {
+            'total_files': total,
+            'valid_files': len(valid_files),
+            'broken_files': len(broken_files),
+            'total_rules': total_rules,
+            'duplicate_rules': len(duplicates),
+            'success_rate': round(len(valid_files) / total * 100, 2) if total > 0 else 0
+        },
+        'duplicates': duplicates_list,
+        'valid_files': [f.to_dict() for f in valid_files],
+        'broken_files': [f.to_dict() for f in broken_files]
+    }
+    
+    # Add deduplication data if available
+    if dedup_data:
+        report['deduplication'] = dedup_data
+    
+    os.makedirs(os.path.dirname(output_file) if os.path.dirname(output_file) else '.', exist_ok=True)
+    with open(output_file, 'w', encoding='utf-8') as f:
+        json.dump(report, f, indent=2)
+    
+    return report
+
+
+def generate_file_markdown_report_with_dedup(valid_files, broken_files, duplicates, dedup_tracker, output_file):
+    """Generate Markdown report for file-level validation with deduplication details."""
+    with open(output_file, 'w', encoding='utf-8') as f:
+        f.write("# YARA File Validation Report\n\n")
+        f.write(f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"**Mode:** File-level validation")
+        if dedup_tracker:
+            f.write(" with deduplication")
+        f.write("\n\n")
+        
+        # Summary
+        total = len(valid_files) + len(broken_files)
+        total_rules = sum(file.rule_count for file in valid_files + broken_files)
+        success_rate = round(len(valid_files) / total * 100, 2) if total > 0 else 0
+        
+        f.write("## Summary\n\n")
+        f.write(f"| Metric | Count |\n")
+        f.write(f"|--------|-------|\n")
+        f.write(f"| Total Files | {total} |\n")
+        f.write(f"| ✅ Valid Files | {len(valid_files)} |\n")
+        f.write(f"| ❌ Broken Files | {len(broken_files)} |\n")
+        f.write(f"| Total Rules | {total_rules} |\n")
+        
+        if not dedup_tracker:
+            f.write(f"| ⚠️ Duplicate Rule Names | {len(duplicates)} |\n")
+        else:
+            stats = dedup_tracker.get_statistics()
+            f.write(f"| 🔄 Rules Renamed | {stats['renames']} |\n")
+            f.write(f"| 🗑️ Duplicates Removed | {stats['removals']} |\n")
+        
+        f.write(f"| Success Rate | {success_rate}% |\n\n")
+        
+        # Status
+        if len(broken_files) == 0 and (not duplicates or dedup_tracker):
+            f.write("**Status:** ✅ All files validated successfully")
+            if dedup_tracker:
+                f.write(", duplicates handled")
+            f.write("\n\n")
+        else:
+            if len(broken_files) > 0:
+                f.write(f"**Status:** ⚠️ {len(broken_files)} file(s) failed validation")
+            if duplicates and not dedup_tracker:
+                if len(broken_files) > 0:
+                    f.write(f" AND {len(duplicates)} duplicate rule name(s) found")
+                else:
+                    f.write(f"**Status:** ⚠️ {len(duplicates)} duplicate rule name(s) found")
+            f.write("\n\n")
+        
+        # Deduplication report
+        if dedup_tracker:
+            stats = dedup_tracker.get_statistics()
+            if stats['total_duplicates'] > 0:
+                f.write("## 🔄 Deduplication Report\n\n")
+                f.write(f"**Total Duplicates Found:** {stats['total_duplicates']}\n\n")
+                f.write("Rules were deduplicated **within each file** while preserving imports and dependencies.\n\n")
+                
+                # Renamed rules
+                if dedup_tracker.renames:
+                    f.write(f"### 📝 Renamed Rules ({len(dedup_tracker.renames)})\n\n")
+                    f.write("The following rules had name conflicts and were renamed:\n\n")
+                    
+                    for rename in dedup_tracker.renames:
+                        f.write(f"#### `{rename['original_name']}` → `{rename['new_name']}`\n\n")
+                        f.write(f"- **File:** `{rename['file']}`\n")
+                        f.write(f"- **Reason:** {rename['reason']}\n")
+                        f.write(f"- **Original Hash:** `{rename['original_hash']}`\n")
+                        f.write(f"- **New Hash:** `{rename['new_hash']}`\n\n")
+                
+                # Removed duplicates
+                if dedup_tracker.removals:
+                    f.write(f"### 🗑️ Removed Duplicates ({len(dedup_tracker.removals)})\n\n")
+                    f.write("The following rules were true duplicates (identical content) and were removed:\n\n")
+                    
+                    for removal in dedup_tracker.removals:
+                        f.write(f"#### `{removal['rule_name']}`\n\n")
+                        f.write(f"- **File:** `{removal['file']}`\n")
+                        f.write(f"- **Reason:** {removal['reason']}\n")
+                        f.write(f"- **Hash:** `{removal['hash']}`\n\n")
+                
+                f.write("---\n\n")
+        
+        # Duplicate rules warning (if no dedup)
+        if not dedup_tracker and duplicates:
+            f.write("## ⚠️ Duplicate Rule Names\n\n")
+            f.write("**CRITICAL:** YARA requires all rule names to be unique across all loaded files.\n")
+            f.write("The following rule names appear in multiple files and must be renamed:\n\n")
+            
+            for rule_name, file_list in sorted(duplicates.items()):
+                f.write(f"### ⚠️ `{rule_name}` (appears in {len(file_list)} files)\n\n")
+                for filepath in file_list:
+                    f.write(f"- `{filepath}`\n")
+                f.write("\n")
+            
+            f.write("**💡 Recommendation:** Use `--deduplicate` flag to automatically handle duplicates.\n\n")
+            f.write("---\n\n")
+        
+        # Valid files
+        if valid_files:
+            f.write("## ✅ Valid Files\n\n")
+            for file in valid_files:
+                suffix = " *(deduplicated)*" if file.was_deduplicated else ""
+                f.write(f"- **{file.filename}** ({file.rule_count} rule(s)){suffix} - `{file.filepath}`\n")
+            f.write("\n")
+        
+        # Broken files
+        if broken_files:
+            f.write("## ❌ Broken Files\n\n")
+            for i, file in enumerate(broken_files, 1):
+                f.write(f"### {i}. {file.filename}\n\n")
+                f.write(f"- **Path:** `{file.filepath}`\n")
+                f.write(f"- **Rules:** {file.rule_count}\n")
+                f.write(f"- **Error:**\n")
+                f.write("```\n")
+                f.write(f"{file.error_data}\n")
+                f.write("```\n\n")
+                
+                # Show first 20 lines of content
+                if file.content:
+                    f.write("<details>\n")
+                    f.write("<summary>View file content (first 20 lines)</summary>\n\n")
+                    f.write("```yara\n")
+                    lines = file.content.split('\n')
+                    for line_num, line in enumerate(lines[:20], 1):
+                        f.write(f"{line_num:4d}: {line}\n")
+                    if len(lines) > 20:
+                        f.write(f"... ({len(lines) - 20} more lines)\n")
+                    f.write("```\n")
+                    f.write("</details>\n\n")
+                
+                f.write("---\n\n")
+
 
 
 def generate_rule_json_report(valid_rules, broken_rules, duplicates, output_file):
@@ -1186,18 +1456,21 @@ def generate_rule_markdown_report_with_dedup(valid_rules, broken_rules, duplicat
 # MAIN VALIDATION WORKFLOWS
 # ============================================================================
 
-def validate_files_mode(directory, verbose=False, output_valid_dir=None, 
+def validate_files_mode(directory, verbose=False, enable_deduplication=False, output_valid_dir=None, 
                        output_failed_dir=None, json_report=None, markdown_report=None):
     """Validate entire files (default mode)."""
     
+    mode_name = "FILE MODE WITH DEDUPLICATION" if enable_deduplication else "FILE MODE"
     print("="*80)
-    print("YARA File Validator - FILE MODE")
+    print(f"YARA File Validator - {mode_name}")
     print("="*80)
     print(f"Directory: {os.path.abspath(directory)}")
     try:
         print(f"YARA Version: {yara.__version__}")
     except:
         print("YARA Version: Unknown")
+    if enable_deduplication:
+        print(f"Deduplication: ENABLED (rules deduplicated within files)")
     print("="*80)
     
     # Collect files
@@ -1210,7 +1483,7 @@ def validate_files_mode(directory, verbose=False, output_valid_dir=None,
     print(f"\n📁 Found {len(yara_files)} YARA file(s)")
     
     # Initialize validator
-    validator = FileValidator()
+    validator = FileValidator(enable_deduplication=enable_deduplication)
     
     # Add files
     print("\n📥 Loading files...")
@@ -1224,6 +1497,9 @@ def validate_files_mode(directory, verbose=False, output_valid_dir=None,
     
     # Validate
     print("\n🔍 Validating files...")
+    if enable_deduplication:
+        print("    (Deduplicating rules within each file...)")
+    
     valid_files, broken_files = validator.validate_all()
     
     # Check for duplicate rule names
@@ -1241,13 +1517,46 @@ def validate_files_mode(directory, verbose=False, output_valid_dir=None,
     print(f"📊 Total rules:   {total_rules}")
     
     # Report duplicate rule names
-    if duplicates:
+    if not enable_deduplication and duplicates:
         print(f"⚠️  Duplicate rule names found: {len(duplicates)}")
+    elif enable_deduplication:
+        dedup_report = validator.get_deduplication_report()
+        if dedup_report:
+            stats = dedup_report.get_statistics()
+            print(f"🔄 Deduplication: {stats['renames']} renamed, {stats['removals']} removed")
     
     print("="*80)
     
-    # Print duplicate details
-    if duplicates:
+    # Print deduplication details if verbose
+    if enable_deduplication and verbose:
+        dedup_report = validator.get_deduplication_report()
+        if dedup_report and (dedup_report.renames or dedup_report.removals):
+            print("\n" + "="*80)
+            print("🔄 DETAILED DEDUPLICATION REPORT")
+            print("="*80)
+            
+            if dedup_report.renames:
+                print(f"\n📝 RENAMED RULES ({len(dedup_report.renames)}):\n")
+                for rename in dedup_report.renames:
+                    print(f"  🔄 '{rename['original_name']}' → '{rename['new_name']}'")
+                    print(f"     File: {rename['file']}")
+                    print(f"     Reason: {rename['reason']}")
+                    print(f"     Hash: {rename['original_hash']} → {rename['new_hash']}")
+                    print()
+            
+            if dedup_report.removals:
+                print(f"🗑️  REMOVED DUPLICATES ({len(dedup_report.removals)}):\n")
+                for removal in dedup_report.removals:
+                    print(f"  ✗ '{removal['rule_name']}'")
+                    print(f"     File: {removal['file']}")
+                    print(f"     Reason: {removal['reason']}")
+                    print(f"     Hash: {removal['hash']}")
+                    print()
+            
+            print("="*80)
+    
+    # Print duplicate details (only if not using deduplication)
+    if not enable_deduplication and duplicates:
         print("\n" + "="*80)
         print(f"⚠️  DUPLICATE RULE NAMES DETECTED ({len(duplicates)} conflicts)")
         print("="*80)
@@ -1261,8 +1570,8 @@ def validate_files_mode(directory, verbose=False, output_valid_dir=None,
             print()
         
         print("="*80)
-        print("💡 TIP: Add a prefix or suffix to make rule names unique")
-        print("    Example: 'MalwareRule' → 'Vendor_MalwareRule' or 'MalwareRule_v1'")
+        print("💡 TIP: Use --deduplicate flag to automatically handle duplicates")
+        print("    python validate_yara_rules.py ./rules --deduplicate --output-valid-dir deduped/")
         print("="*80)
     
     # Print details if verbose
@@ -1270,7 +1579,8 @@ def validate_files_mode(directory, verbose=False, output_valid_dir=None,
         if valid_files:
             print(f"\n{'='*25} VALID FILES ({len(valid_files)}) {'='*25}")
             for file in valid_files:
-                print(f"  ✓ {file.filename} ({file.rule_count} rules)")
+                suffix = " (deduplicated)" if file.was_deduplicated else ""
+                print(f"  ✓ {file.filename} ({file.rule_count} rules){suffix}")
         
         if broken_files:
             print(f"\n{'='*25} BROKEN FILES ({len(broken_files)}) {'='*25}")
@@ -1292,17 +1602,26 @@ def validate_files_mode(directory, verbose=False, output_valid_dir=None,
     
     if json_report:
         print(f"\n📝 Generating JSON report: {json_report}")
-        generate_file_json_report(valid_files, broken_files, duplicates, json_report)
+        dedup_data = validator.get_deduplication_report().to_dict() if enable_deduplication else None
+        generate_file_json_report_with_dedup(valid_files, broken_files, duplicates, dedup_data, json_report)
     
     if markdown_report:
         print(f"\n📝 Generating Markdown report: {markdown_report}")
-        generate_file_markdown_report(valid_files, broken_files, duplicates, markdown_report)
+        dedup_data = validator.get_deduplication_report() if enable_deduplication else None
+        generate_file_markdown_report_with_dedup(valid_files, broken_files, duplicates, dedup_data, markdown_report)
     
     print("\n" + "="*80)
     if broken_files:
         print(f"⚠️  Validation completed with {len(broken_files)} file failure(s)")
     else:
         print("✅ All files validated successfully!")
+    
+    if enable_deduplication:
+        dedup_report = validator.get_deduplication_report()
+        if dedup_report:
+            stats = dedup_report.get_statistics()
+            print(f"🔄 Deduplication: {stats['renames']} renamed, {stats['removals']} removed")
+    
     print("="*80)
     
     return len(valid_files), len(broken_files)
@@ -1500,42 +1819,48 @@ OPERATION MODES:
   FILE MODE (default):
     Validates entire files as-is, preserving all rules, imports, and dependencies.
     This is the recommended mode for most use cases.
+    With --deduplicate: Removes duplicates WITHIN each file, keeping files intact.
     
     Example: python %(prog)s ./rules --output-valid-dir validated/
+    Example: python %(prog)s ./rules --deduplicate --output-valid-dir deduped/
   
   SPLIT MODE (--split-rules):
     Parses individual rules from files and validates each separately.
     Useful for isolating issues in multi-rule files.
+    With --deduplicate: Each rule becomes a separate file.
     
     Example: python %(prog)s ./rules --split-rules --output-valid-dir validated/
+    Example: python %(prog)s ./rules --split-rules --deduplicate --output-valid-dir deduped/
   
   DEDUPLICATION (--deduplicate):
     Automatically handles duplicate rules:
     - Renames rules with name conflicts (same name, different content)
     - Removes true duplicates (same name and content)
-    Only works with --split-rules mode.
     
-    Example: python %(prog)s ./rules --split-rules --deduplicate --output-valid-dir deduped/
+    FILE MODE: Deduplicates within each file, preserves imports/dependencies
+    SPLIT MODE: Creates separate files for each unique rule
+    
+    Example: python %(prog)s ./rules --deduplicate --output-valid-dir deduped/
 
 EXAMPLES:
 
   # Validate complete files (recommended)
   python %(prog)s ./rules --output-valid-dir validated/
   
-  # Validate files with detailed output
-  python %(prog)s ./rules --verbose --output-valid-dir validated/ --output-failed-dir failed/
+  # Deduplicate while keeping files together (RECOMMENDED)
+  python %(prog)s ./rules --deduplicate --output-valid-dir deduped/
+  
+  # Deduplicate with verbose output
+  python %(prog)s ./rules --deduplicate --verbose --output-valid-dir deduped/
   
   # Split and validate individual rules
   python %(prog)s ./rules --split-rules --output-valid-dir validated/
   
-  # Auto-deduplicate rules (split mode)
+  # Split mode with deduplication
   python %(prog)s ./rules --split-rules --deduplicate --output-valid-dir deduped/
   
-  # Deduplicate with verbose output
-  python %(prog)s ./rules --split-rules --deduplicate --verbose --output-valid-dir deduped/
-  
   # Generate reports
-  python %(prog)s ./rules --json-report report.json --markdown-report report.md
+  python %(prog)s ./rules --deduplicate --json-report report.json --markdown-report report.md
         """
     )
     
@@ -1546,7 +1871,7 @@ EXAMPLES:
                        help='Parse and validate individual rules separately (split mode)')
     
     parser.add_argument('--deduplicate', action='store_true',
-                       help='Auto-deduplicate rules: rename conflicts, remove true duplicates (requires --split-rules)')
+                       help='Auto-deduplicate rules: rename conflicts, remove true duplicates (works in both modes)')
     
     parser.add_argument('--verbose', '-v', action='store_true',
                        help='Show detailed output including deduplication changes')
@@ -1564,12 +1889,6 @@ EXAMPLES:
                        help='Generate Markdown report')
     
     args = parser.parse_args()
-    
-    # Validate arguments
-    if args.deduplicate and not args.split_rules:
-        print("❌ Error: --deduplicate requires --split-rules mode", file=sys.stderr)
-        print("   Use: python validate_yara_rules.py ./rules --split-rules --deduplicate", file=sys.stderr)
-        sys.exit(1)
     
     # Validate directory
     if not os.path.isdir(args.directory):
@@ -1592,6 +1911,7 @@ EXAMPLES:
             valid_count, broken_count = validate_files_mode(
                 args.directory,
                 verbose=args.verbose,
+                enable_deduplication=args.deduplicate,
                 output_valid_dir=args.output_valid_dir,
                 output_failed_dir=args.output_failed_dir,
                 json_report=args.json_report,
