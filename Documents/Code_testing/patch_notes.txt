@@ -1,0 +1,448 @@
+# PATCH FILE: Content-Based Deduplication for YARA Validator
+# Apply these changes to validate_yara_rules.py
+
+# ==============================================================================
+# CHANGE 1: Update RuleFingerprint._compute_hash() method
+# ==============================================================================
+# Location: Line ~60-70 in class RuleFingerprint
+
+# REPLACE THIS:
+"""
+def _compute_hash(self):
+    '''Compute SHA256 hash of normalized rule content.'''
+    # Normalize: remove leading/trailing whitespace, collapse multiple spaces
+    normalized = re.sub(r'\s+', ' ', self.rule_source.strip())
+    return hashlib.sha256(normalized.encode('utf-8')).hexdigest()
+"""
+
+# WITH THIS:
+"""
+def _compute_hash(self):
+    '''
+    Compute SHA256 hash of normalized rule content (excluding rule name).
+    This allows detection of identical rules with different names.
+    '''
+    # Extract only the rule body (everything after the rule declaration)
+    # This matches: rule <name> { ... } and captures only the { ... } part
+    match = re.search(r'(?i)^\s*(?:private\s+|global\s+)?rule\s+\w+\s*(\{.*\})', 
+                     self.rule_source, re.DOTALL | re.MULTILINE)
+    
+    if match:
+        # Hash only the body: { meta: ... strings: ... condition: ... }
+        rule_body = match.group(1)
+    else:
+        # Fallback to full source if parsing fails (shouldn't happen with valid YARA)
+        rule_body = self.rule_source
+    
+    # Normalize: remove leading/trailing whitespace, collapse multiple spaces
+    # This makes the hash consistent regardless of formatting differences
+    normalized = re.sub(r'\s+', ' ', rule_body.strip())
+    return hashlib.sha256(normalized.encode('utf-8')).hexdigest()
+"""
+
+# ==============================================================================
+# CHANGE 2: Update DuplicateInfo class
+# ==============================================================================
+# Location: Line ~85-95 in class DuplicateInfo
+
+# ADD this new constant after TYPE_TRUE_DUPLICATE:
+"""
+TYPE_CONTENT_DUPLICATE = 'content_duplicate'  # Different name, same content (NEW)
+"""
+
+# UPDATE __init__ method - ADD original_name parameter:
+"""
+def __init__(self, rule_name, duplicate_type, original_file, original_hash, original_name=None):
+    self.rule_name = rule_name
+    self.duplicate_type = duplicate_type
+    self.original_file = original_file
+    self.original_hash = original_hash
+    self.original_name = original_name  # Used for content duplicates (NEW)
+    self.occurrences = []
+"""
+
+# UPDATE to_dict() method - ADD original_name to result:
+"""
+def to_dict(self):
+    result = {
+        'rule_name': self.rule_name,
+        'type': self.duplicate_type,
+        'original_file': self.original_file,
+        'original_hash': self.original_hash[:16],
+        'occurrences': self.occurrences
+    }
+    if self.original_name:  # NEW
+        result['original_name'] = self.original_name  # NEW
+    return result
+"""
+
+# ==============================================================================
+# CHANGE 3: Update DeduplicationTracker.register_rule() method
+# ==============================================================================
+# Location: Line ~130-200 in class DeduplicationTracker
+
+# REPLACE the entire register_rule method with this:
+"""
+def register_rule(self, rule_name, rule_content, file_path):
+    '''
+    Register a rule and check for duplicates.
+    Returns: (should_keep, new_name_if_renamed, duplicate_info)
+    '''
+    fingerprint = RuleFingerprint(rule_content)
+    rule_hash = fingerprint.hash
+    
+    # FIRST: Check if this exact content already exists (regardless of name)
+    # This detects identical rules with different names
+    if rule_hash in self.hash_registry:
+        existing_names = self.hash_registry[rule_hash]
+        if existing_names:
+            # Content duplicate - this is the SAME rule with a different name
+            original_name = existing_names[0]
+            original_rule = self.rule_registry[original_name]
+            
+            # Check if the current rule name matches the original
+            if rule_name == original_name:
+                # TRUE DUPLICATE: Same name AND same content
+                duplicate_info = DuplicateInfo(
+                    rule_name, 
+                    DuplicateInfo.TYPE_TRUE_DUPLICATE,
+                    original_rule['file'],
+                    original_rule['hash']
+                )
+                duplicate_info.add_occurrence(file_path, rule_hash, renamed_to=None)
+                self.duplicates.append(duplicate_info)
+                self.removals.append({
+                    'rule_name': rule_name,
+                    'file': file_path,
+                    'reason': f'True duplicate - identical name and content to rule in {original_rule["file"]}',
+                    'hash': rule_hash[:16],
+                    'duplicate_type': 'true_duplicate'
+                })
+                return False, None, duplicate_info
+            else:
+                # CONTENT DUPLICATE: Different name, same content (NEW)
+                duplicate_info = DuplicateInfo(
+                    rule_name,
+                    DuplicateInfo.TYPE_CONTENT_DUPLICATE,
+                    original_rule['file'],
+                    original_rule['hash'],
+                    original_name=original_name
+                )
+                duplicate_info.add_occurrence(file_path, rule_hash, renamed_to=None)
+                self.duplicates.append(duplicate_info)
+                self.removals.append({
+                    'rule_name': rule_name,
+                    'file': file_path,
+                    'reason': f'Content duplicate - identical rule body to "{original_name}" in {original_rule["file"]} (only rule name differs)',
+                    'hash': rule_hash[:16],
+                    'original_name': original_name,
+                    'duplicate_type': 'content_duplicate'
+                })
+                return False, None, duplicate_info
+    
+    # SECOND: Check if this rule name already exists (with different content)
+    if rule_name in self.rule_registry:
+        existing = self.rule_registry[rule_name]
+        
+        # This must be a name conflict since we already checked content above
+        # NAME CONFLICT: Same name, different content - rename it
+        new_name = self._find_unique_name(rule_name)
+        duplicate_info = DuplicateInfo(
+            rule_name,
+            DuplicateInfo.TYPE_NAME_CONFLICT,
+            existing['file'],
+            existing['hash']
+        )
+        duplicate_info.add_occurrence(file_path, rule_hash, renamed_to=new_name)
+        self.duplicates.append(duplicate_info)
+        self.renames.append({
+            'original_name': rule_name,
+            'new_name': new_name,
+            'file': file_path,
+            'reason': f'Name conflict - different rule with same name exists in {existing["file"]}',
+            'original_hash': existing['hash'][:16],
+            'new_hash': rule_hash[:16],
+            'duplicate_type': 'name_conflict'
+        })
+        
+        # Register the renamed rule
+        self.rule_registry[new_name] = {
+            'hash': rule_hash,
+            'file': file_path,
+            'content': rule_content
+        }
+        
+        # Track hash
+        if rule_hash not in self.hash_registry:
+            self.hash_registry[rule_hash] = []
+        self.hash_registry[rule_hash].append(new_name)
+        
+        return True, new_name, duplicate_info
+    else:
+        # New rule - register it
+        self.rule_registry[rule_name] = {
+            'hash': rule_hash,
+            'file': file_path,
+            'content': rule_content
+        }
+        
+        # Track hash
+        if rule_hash not in self.hash_registry:
+            self.hash_registry[rule_hash] = []
+        self.hash_registry[rule_hash].append(rule_name)
+        
+        return True, None, None
+"""
+
+# ==============================================================================
+# CHANGE 4: Update DeduplicationTracker.get_statistics() method
+# ==============================================================================
+# Location: Line ~220 in class DeduplicationTracker
+
+# REPLACE THIS:
+"""
+def get_statistics(self):
+    '''Get deduplication statistics.'''
+    name_conflicts = sum(1 for d in self.duplicates if d.duplicate_type == DuplicateInfo.TYPE_NAME_CONFLICT)
+    true_duplicates = sum(1 for d in self.duplicates if d.duplicate_type == DuplicateInfo.TYPE_TRUE_DUPLICATE)
+    
+    return {
+        'total_duplicates': len(self.duplicates),
+        'name_conflicts': name_conflicts,
+        'true_duplicates': true_duplicates,
+        'renames': len(self.renames),
+        'removals': len(self.removals)
+    }
+"""
+
+# WITH THIS:
+"""
+def get_statistics(self):
+    '''Get deduplication statistics.'''
+    name_conflicts = sum(1 for d in self.duplicates if d.duplicate_type == DuplicateInfo.TYPE_NAME_CONFLICT)
+    true_duplicates = sum(1 for d in self.duplicates if d.duplicate_type == DuplicateInfo.TYPE_TRUE_DUPLICATE)
+    content_duplicates = sum(1 for d in self.duplicates if d.duplicate_type == DuplicateInfo.TYPE_CONTENT_DUPLICATE)  # NEW
+    
+    return {
+        'total_duplicates': len(self.duplicates),
+        'name_conflicts': name_conflicts,
+        'true_duplicates': true_duplicates,
+        'content_duplicates': content_duplicates,  # NEW
+        'renames': len(self.renames),
+        'removals': len(self.removals)
+    }
+"""
+
+# ==============================================================================
+# CHANGE 5: Update console output in FileValidator._deduplicate_file_content()
+# ==============================================================================
+# Location: Line ~330 in FileValidator class
+
+# FIND this block:
+"""
+if not should_keep:
+    # True duplicate - skip it
+    changed = True
+    print(f"  🗑️  Removing duplicate: '{rule_name}' from {os.path.basename(yara_file.filepath)}")
+    continue
+"""
+
+# REPLACE WITH:
+"""
+if not should_keep:
+    # Duplicate - skip it
+    changed = True
+    if duplicate_info and duplicate_info.duplicate_type == DuplicateInfo.TYPE_CONTENT_DUPLICATE:
+        print(f"  🗑️  Removing content duplicate: '{rule_name}' (identical to '{duplicate_info.original_name}') from {os.path.basename(yara_file.filepath)}")
+    else:
+        print(f"  🗑️  Removing duplicate: '{rule_name}' from {os.path.basename(yara_file.filepath)}")
+    continue
+"""
+
+# ==============================================================================
+# CHANGE 6: Update console output in RuleValidator.add_file()
+# ==============================================================================
+# Location: Line ~430 in RuleValidator class
+
+# FIND this block:
+"""
+if not should_keep:
+    # This is a true duplicate - mark and skip
+    rule.mark_as_duplicate(duplicate_info)
+    self.rules.append(rule)  # Add to list but marked as removed
+    continue
+"""
+
+# REPLACE WITH:
+"""
+if not should_keep:
+    # This is a duplicate - mark and skip
+    rule.mark_as_duplicate(duplicate_info)
+    self.rules.append(rule)  # Add to list but marked as removed
+    
+    # Print appropriate message based on duplicate type
+    if duplicate_info.duplicate_type == DuplicateInfo.TYPE_CONTENT_DUPLICATE:
+        print(f"  🗑️  Removing content duplicate: '{rule.rule_name}' (identical to '{duplicate_info.original_name}') from {os.path.basename(filepath)}")
+    else:
+        print(f"  🗑️  Removing duplicate: '{rule.rule_name}' from {os.path.basename(filepath)}")
+    continue
+"""
+
+# ==============================================================================
+# CHANGE 7: Add content duplicates to verbose output in validate_files_mode()
+# ==============================================================================
+# Location: Line ~680 in validate_files_mode function
+
+# FIND the section that prints "DETAILED DEDUPLICATION REPORT"
+# ADD this NEW section BEFORE the "RENAMED RULES" section:
+
+"""
+# Content duplicates (NEW)
+content_dupes = [r for r in dedup_report.removals if r.get('duplicate_type') == 'content_duplicate']
+if content_dupes:
+    print(f"\n📋 CONTENT DUPLICATES ({len(content_dupes)}):\n")
+    print("These rules had IDENTICAL content but different names:\n")
+    for removal in content_dupes:
+        print(f"  ✗ '{removal['rule_name']}' → IDENTICAL TO '{removal['original_name']}'")
+        print(f"     File: {removal['file']}")
+        print(f"     Reason: {removal['reason']}")
+        print(f"     Hash: {removal['hash']}")
+        print()
+"""
+
+# Also ADD content_duplicates to the summary print:
+# FIND:
+"""
+print(f"🔄 Deduplication: {stats['renames']} renamed, {stats['removals']} removed")
+"""
+
+# REPLACE WITH:
+"""
+print(f"🔄 Deduplication: {stats['renames']} renamed, {stats['removals']} removed")
+if stats['content_duplicates'] > 0:
+    print(f"📋 Content duplicates: {stats['content_duplicates']} (identical rules with different names)")
+"""
+
+# ==============================================================================
+# CHANGE 8: Add content duplicates to verbose output in validate_split_mode()
+# ==============================================================================
+# Location: Line ~820 in validate_split_mode function
+
+# Apply the same changes as CHANGE 7, but in the validate_split_mode function
+
+# ==============================================================================
+# CHANGE 9: Update markdown report generation
+# ==============================================================================
+# Location: Line ~950 in generate_file_markdown_report_with_dedup()
+
+# FIND the "Deduplication Report" section
+# ADD this NEW section RIGHT AFTER "Total Duplicates Found" line:
+
+"""
+# Content duplicates section (NEW)
+content_dupes = [r for r in dedup_tracker.removals if r.get('duplicate_type') == 'content_duplicate']
+if content_dupes:
+    f.write(f"### 📋 Content Duplicates ({len(content_dupes)})\n\n")
+    f.write("**These rules had identical content but different names** and were removed:\n\n")
+    
+    for removal in content_dupes:
+        f.write(f"#### `{removal['rule_name']}`\n\n")
+        f.write(f"- **File:** `{removal['file']}`\n")
+        f.write(f"- **Identical To:** `{removal['original_name']}`\n")
+        f.write(f"- **Reason:** {removal['reason']}\n")
+        f.write(f"- **Content Hash:** `{removal['hash']}`\n")
+        f.write(f"- **Note:** The rule body (strings, meta, condition) was **100% identical** to the original rule, only the rule name was different.\n\n")
+"""
+
+# Also update the "True Duplicates" section to separate it:
+# CHANGE the subsection to:
+"""
+# True duplicates (same name AND content)
+true_dupes = [r for r in dedup_tracker.removals if r.get('duplicate_type') == 'true_duplicate']
+if true_dupes:
+    f.write(f"### 🗑️ True Duplicates ({len(true_dupes)})\n\n")
+    f.write("The following rules were exact duplicates (identical name AND content) and were removed:\n\n")
+    
+    for removal in true_dupes:
+        f.write(f"#### `{removal['rule_name']}`\n\n")
+        f.write(f"- **File:** `{removal['file']}`\n")
+        f.write(f"- **Reason:** {removal['reason']}\n")
+        f.write(f"- **Hash:** `{removal['hash']}`\n\n")
+"""
+
+# ==============================================================================
+# CHANGE 10: Update YaraRule.to_dict() method
+# ==============================================================================
+# Location: Line ~300 in YaraRule class
+
+# FIND:
+"""
+if self.was_removed:
+    result['removed_as_duplicate'] = True
+"""
+
+# REPLACE WITH:
+"""
+if self.was_removed:
+    result['removed_as_duplicate'] = True
+    if self.duplicate_info:  # NEW
+        result['duplicate_type'] = self.duplicate_info.duplicate_type  # NEW
+"""
+
+# ==============================================================================
+# CHANGE 11: Update summary statistics display
+# ==============================================================================
+# Location: Multiple locations (line ~660, ~690, ~830, etc.)
+
+# FIND lines like:
+"""
+f.write(f"| 🔄 Rules Renamed | {stats['renames']} |\n")
+f.write(f"| 🗑️ Duplicates Removed | {stats['removals']} |\n")
+"""
+
+# ADD AFTER:
+"""
+f.write(f"| 📋 Content Duplicates | {stats['content_duplicates']} |\n")
+"""
+
+# ==============================================================================
+# TESTING THE CHANGES
+# ==============================================================================
+
+# Create test files to verify the changes work:
+
+# test_content_duplicate_a.yar:
+"""
+rule TestRule_A {
+    strings:
+        $test = "test_pattern"
+    condition:
+        $test
+}
+"""
+
+# test_content_duplicate_b.yar:
+"""
+rule TestRule_B {
+    strings:
+        $test = "test_pattern"
+    condition:
+        $test
+}
+"""
+
+# Run validation:
+"""
+python validate_yara_rules.py ./test_rules --deduplicate --verbose
+"""
+
+# Expected output should include:
+"""
+📋 CONTENT DUPLICATES (1):
+  ✗ 'TestRule_B' → IDENTICAL TO 'TestRule_A'
+     Reason: Content duplicate - identical rule body to "TestRule_A" in test_content_duplicate_a.yar (only rule name differs)
+"""
+
+# ==============================================================================
+# END OF PATCH FILE
+# ==============================================================================
