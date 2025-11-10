@@ -27,27 +27,12 @@ class YaraRuleParser:
         content = self._remove_comments(content)
         
         # Find all rule definitions
-        # Use a simpler approach that handles nested braces properly
-        rule_pattern = r'rule\s+(\w+)\s*(?::\s*[\w\s]+)?\s*\{'
+        rule_pattern = r'rule\s+(\w+)\s*(?::\s*[\w\s]+)?\s*\{([^}]*(?:\{[^}]*\}[^}]*)*)\}'
         
-        matches = list(re.finditer(rule_pattern, content, re.DOTALL))
-        
-        for i, match in enumerate(matches):
+        for match in re.finditer(rule_pattern, content, re.DOTALL):
             rule_name = match.group(1)
-            rule_start = match.end()
+            rule_body = match.group(2)
             
-            # Find the matching closing brace for this rule
-            brace_count = 1
-            pos = rule_start
-            
-            while pos < len(content) and brace_count > 0:
-                if content[pos] == '{':
-                    brace_count += 1
-                elif content[pos] == '}':
-                    brace_count -= 1
-                pos += 1
-            
-            rule_body = content[rule_start:pos-1]
             self.rules[rule_name] = rule_body
             
             # Extract dependencies from the condition section
@@ -76,35 +61,18 @@ class YaraRuleParser:
         
         condition = condition_match.group(1)
         
-        # YARA keywords and functions to exclude from rule name matching
-        yara_keywords = {
-            'all', 'any', 'them', 'for', 'of', 'in', 'and', 'or', 'not',
-            'true', 'false', 'defined', 'uint8', 'uint16', 'uint32', 'uint64',
-            'int8', 'int16', 'int32', 'int64', 'filesize', 'entrypoint',
-            'at', 'none', 'pe', 'elf', 'math', 'hash'
-        }
-        
-        # Pattern to match potential rule names (any valid identifier)
-        rule_ref_pattern = r'\b([a-zA-Z_]\w*)\b'
+        # Pattern to match rule references in conditions
+        # Matches: rule_name, rule_name(), rule_name[index]
+        # Excludes: keywords like 'all', 'any', 'them', 'for', 'of', 'in', etc.
+        rule_ref_pattern = r'\b(?!(?:all|any|them|for|of|in|and|or|not|true|false|defined|uint8|uint16|uint32|int8|int16|int32|filesize|entrypoint|at|in)\b)([a-zA-Z_]\w*)(?:\s*\(|\s*\[|\s*(?=\s|$|and|or|not|\)))'
         
         for match in re.finditer(rule_ref_pattern, condition):
             potential_rule = match.group(1)
             
-            # Skip if it's a YARA keyword
-            if potential_rule.lower() in yara_keywords:
-                continue
-            
-            # Skip if it's the current rule (self-reference)
-            if potential_rule == current_rule:
-                continue
-            
-            # Skip if it looks like a variable reference (starts with $)
-            start_pos = match.start()
-            if start_pos > 0 and condition[start_pos - 1] == '$':
-                continue
-            
-            # Add as potential dependency - will be validated later
-            dependencies.add(potential_rule)
+            # Check if this is actually a rule name (exists in the file)
+            # We'll collect all potential references and validate later
+            if potential_rule != current_rule:
+                dependencies.add(potential_rule)
         
         return dependencies
     
