@@ -446,7 +446,6 @@ class YaraFile:
     STATUS_UNKNOWN = 'unknown'
     STATUS_VALID = 'valid'
     STATUS_BROKEN = 'broken'
-    STATUS_INVALID_METADATA = 'invalid_metadata'
     
     def __init__(self, filepath, content=None):
         self.filepath = filepath
@@ -492,8 +491,6 @@ class YaraFile:
     
     def __repr__(self):
         suffix = " (deduplicated)" if self.was_deduplicated else ""
-        if self.status == self.STATUS_INVALID_METADATA:
-            suffix += " (invalid metadata)"
         return f"<YaraFile {self.filename} - {self.status} - {self.rule_count} rules{suffix}>"
 
 
@@ -503,7 +500,6 @@ class YaraRule:
     STATUS_UNKNOWN = 'unknown'
     STATUS_VALID = 'valid'
     STATUS_BROKEN = 'broken'
-    STATUS_INVALID_METADATA = 'invalid_metadata'
     
     def __init__(self, source, source_file='', rule_name='', imports=''):
         self.source = source
@@ -579,8 +575,6 @@ class YaraRule:
             suffix = f" (renamed from {self.original_name})"
         elif self.was_removed:
             suffix = " (duplicate removed)"
-        if self.status == self.STATUS_INVALID_METADATA:
-            suffix += " (invalid metadata)"
         return f"<YaraRule {self.rule_name} - {self.status}{suffix}>"
 
 
@@ -782,9 +776,16 @@ class FileValidator:
             # Compile to validate YARA syntax
             yara.compile(source=yara_file.content)
             
-            # Set status based on metadata validation
+            # If metadata validation failed, treat as broken
             if not metadata_valid:
-                yara_file.status = YaraFile.STATUS_INVALID_METADATA
+                yara_file.status = YaraFile.STATUS_BROKEN
+                # Format metadata errors into error_data
+                error_msgs = []
+                for rule_error in yara_file.metadata_errors:
+                    error_msgs.append(f"Rule '{rule_error['rule_name']}' - Metadata validation failed:")
+                    for err in rule_error['errors']:
+                        error_msgs.append(f"  • {err['message']}")
+                yara_file.error_data = "\n".join(error_msgs)
                 return False
             
             yara_file.status = YaraFile.STATUS_VALID
@@ -803,18 +804,14 @@ class FileValidator:
         """Validate all files and return categorized lists."""
         valid = []
         broken = []
-        invalid_metadata = []
         
         for yara_file in self.files:
             if self.validate_file(yara_file):
                 valid.append(yara_file)
             else:
-                if yara_file.status == YaraFile.STATUS_INVALID_METADATA:
-                    invalid_metadata.append(yara_file)
-                else:
-                    broken.append(yara_file)
+                broken.append(yara_file)
         
-        return valid, broken, invalid_metadata
+        return valid, broken
     
     def get_duplicate_rules(self):
         """Get all duplicate rule names across all files."""
@@ -894,8 +891,13 @@ class RuleValidator:
             if self.require_metadata:
                 is_valid, errors = self.metadata_validator.validate_metadata(rule.source, rule.rule_name)
                 if not is_valid:
-                    rule.status = YaraRule.STATUS_INVALID_METADATA
+                    rule.status = YaraRule.STATUS_BROKEN
                     rule.metadata_errors = errors
+                    # Format metadata errors into error_data
+                    error_msgs = [f"Metadata validation failed:"]
+                    for err in errors:
+                        error_msgs.append(f"  • {err}")
+                    rule.error_data = "\n".join(error_msgs)
                     return False
             
             # Compile to validate YARA syntax
@@ -912,19 +914,15 @@ class RuleValidator:
         """Validate all rules and return categorized lists."""
         valid = []
         broken = []
-        invalid_metadata = []
         
         for rule in self.rules:
             if self.validate_rule(rule):
                 if not rule.was_removed:
                     valid.append(rule)
             else:
-                if rule.status == YaraRule.STATUS_INVALID_METADATA:
-                    invalid_metadata.append(rule)
-                else:
-                    broken.append(rule)
+                broken.append(rule)
         
-        return valid, broken, invalid_metadata
+        return valid, broken
     
     def get_duplicate_rules(self):
         """Get all duplicate rule names."""
@@ -1021,40 +1019,6 @@ def write_failed_files(yara_files, output_dir):
     return written_files
 
 
-def write_invalid_metadata_files(yara_files, output_dir):
-    """Write files with invalid metadata to output directory."""
-    os.makedirs(output_dir, exist_ok=True)
-    written_files = []
-    
-    for yara_file in yara_files:
-        output_path = os.path.join(output_dir, yara_file.filename)
-        
-        counter = 1
-        base_name = Path(yara_file.filename).stem
-        ext = Path(yara_file.filename).suffix
-        while os.path.exists(output_path):
-            output_path = os.path.join(output_dir, f"{base_name}_{counter}{ext}")
-            counter += 1
-        
-        header = f"// INVALID METADATA\n"
-        header += f"// Source: {yara_file.filepath}\n"
-        header += f"// Rules: {yara_file.rule_count}\n"
-        header += f"// Metadata Errors: {len(yara_file.metadata_errors)} rule(s) have issues\n"
-        for err in yara_file.metadata_errors:
-            header += f"//   Rule '{err['rule_name']}': {len(err['errors'])} error(s)\n"
-        header += f"// Timestamp: {datetime.now().isoformat()}\n\n"
-        
-        try:
-            with open(output_path, 'w', encoding='utf-8') as f:
-                f.write(header)
-                f.write(yara_file.content)
-            written_files.append(output_path)
-        except Exception as e:
-            print(f"Error writing {output_path}: {e}", file=sys.stderr)
-    
-    return written_files
-
-
 def write_valid_rules(rules, output_dir):
     """Write valid rules to output directory."""
     os.makedirs(output_dir, exist_ok=True)
@@ -1129,46 +1093,237 @@ def write_failed_rules(rules, output_dir):
     return written_files
 
 
-def write_invalid_metadata_rules(rules, output_dir):
-    """Write rules with invalid metadata to output directory."""
-    os.makedirs(output_dir, exist_ok=True)
-    written_files = []
-    rule_name_counts = {}
+# ============================================================================
+# REPORTING FUNCTIONS
+# ============================================================================
+
+def generate_json_report(valid_files_or_rules, broken_files_or_rules, duplicates, dedup_data, 
+                        output_file, mode='file', require_metadata=False):
+    """Generate JSON report for validation."""
+    total = len(valid_files_or_rules) + len(broken_files_or_rules)
     
-    for rule in rules:
-        base_filename = rule.rule_name
+    if mode == 'file':
+        total_rules = sum(f.rule_count for f in valid_files_or_rules + broken_files_or_rules)
+    else:
+        total_rules = total
+    
+    # Format duplicates
+    duplicates_list = []
+    if mode == 'file':
+        for rule_name, file_list in duplicates.items():
+            duplicates_list.append({
+                'rule_name': rule_name,
+                'count': len(file_list),
+                'files': file_list
+            })
+    else:
+        for rule_name, rule_list in duplicates.items():
+            duplicates_list.append({
+                'rule_name': rule_name,
+                'count': len(rule_list),
+                'source_files': [r.source_file for r in rule_list]
+            })
+    
+    report = {
+        'timestamp': datetime.now().isoformat(),
+        'mode': mode,
+        'metadata_validation_enabled': require_metadata,
+        'summary': {
+            'total_files' if mode == 'file' else 'total_rules': total,
+            'valid': len(valid_files_or_rules),
+            'broken': len(broken_files_or_rules),
+            'total_rules': total_rules if mode == 'file' else None,
+            'duplicate_rules': len(duplicates),
+            'success_rate': round(len(valid_files_or_rules) / total * 100, 2) if total > 0 else 0
+        },
+        'duplicates': duplicates_list,
+        'valid': [item.to_dict() for item in valid_files_or_rules],
+        'broken': [item.to_dict() for item in broken_files_or_rules]
+    }
+    
+    # Remove None values
+    report['summary'] = {k: v for k, v in report['summary'].items() if v is not None}
+    
+    # Add deduplication data if available
+    if dedup_data:
+        report['deduplication'] = dedup_data
+    
+    os.makedirs(os.path.dirname(output_file) if os.path.dirname(output_file) else '.', exist_ok=True)
+    with open(output_file, 'w', encoding='utf-8') as f:
+        json.dump(report, f, indent=2)
+    
+    return report
+
+
+def generate_markdown_report(valid_files_or_rules, broken_files_or_rules, duplicates, dedup_tracker, 
+                            output_file, mode='file', require_metadata=False):
+    """Generate Markdown report for validation."""
+    with open(output_file, 'w', encoding='utf-8') as f:
+        f.write("# YARA Validation Report\n\n")
+        f.write(f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"**Mode:** {'File-level' if mode == 'file' else 'Rule-level'} validation")
+        if dedup_tracker:
+            f.write(" with deduplication")
+        if require_metadata:
+            f.write(" + metadata validation")
+        f.write("\n\n")
         
-        if base_filename in rule_name_counts:
-            rule_name_counts[base_filename] += 1
-            output_filename = f"{base_filename}_{rule_name_counts[base_filename]}.yar"
+        # Summary
+        total = len(valid_files_or_rules) + len(broken_files_or_rules)
+        success_rate = round(len(valid_files_or_rules) / total * 100, 2) if total > 0 else 0
+        
+        f.write("## Summary\n\n")
+        f.write(f"| Metric | Count |\n")
+        f.write(f"|--------|-------|\n")
+        if mode == 'file':
+            total_rules = sum(item.rule_count for item in valid_files_or_rules + broken_files_or_rules)
+            f.write(f"| Total Files | {total} |\n")
+            f.write(f"| ✅ Valid Files | {len(valid_files_or_rules)} |\n")
+            f.write(f"| ❌ Broken Files | {len(broken_files_or_rules)} |\n")
+            f.write(f"| Total Rules | {total_rules} |\n")
         else:
-            rule_name_counts[base_filename] = 1
-            output_filename = f"{base_filename}.yar"
+            f.write(f"| Total Rules | {total} |\n")
+            f.write(f"| ✅ Valid Rules | {len(valid_files_or_rules)} |\n")
+            f.write(f"| ❌ Broken Rules | {len(broken_files_or_rules)} |\n")
         
-        output_path = os.path.join(output_dir, output_filename)
-        full_source = rule.get_full_source()
+        if not dedup_tracker and duplicates:
+            f.write(f"| ⚠️ Duplicate Rule Names | {len(duplicates)} |\n")
+        elif dedup_tracker:
+            stats = dedup_tracker.get_statistics()
+            f.write(f"| 🔄 Rules Renamed | {stats['renames']} |\n")
+            f.write(f"| 🗑️ Duplicates Removed | {stats['removals']} |\n")
+            if stats['content_duplicates'] > 0:
+                f.write(f"| 📋 Content Duplicates | {stats['content_duplicates']} |\n")
         
-        header = f"// INVALID METADATA\n"
-        header += f"// Rule: {rule.rule_name}\n"
-        header += f"// Source: {rule.source_file}\n"
-        header += f"// Metadata Errors:\n"
-        for error in rule.metadata_errors:
-            header += f"//   - {error}\n"
-        header += f"// Timestamp: {datetime.now().isoformat()}\n\n"
+        f.write(f"| Success Rate | {success_rate}% |\n\n")
         
-        try:
-            with open(output_path, 'w', encoding='utf-8') as f:
-                f.write(header)
-                f.write(full_source)
-            written_files.append(output_path)
-        except Exception as e:
-            print(f"Error writing {output_path}: {e}", file=sys.stderr)
-    
-    return written_files
-
-
-# The rest of the file continues with reporting functions and main()
-# Due to length constraints, I'll add those in the next message
+        # Status
+        if len(broken_files_or_rules) == 0 and (not duplicates or dedup_tracker):
+            f.write("**Status:** ✅ All validated successfully")
+            if dedup_tracker:
+                f.write(", duplicates handled")
+            f.write("\n\n")
+        else:
+            if len(broken_files_or_rules) > 0:
+                f.write(f"**Status:** ⚠️ {len(broken_files_or_rules)} failure(s)")
+            if duplicates and not dedup_tracker:
+                if len(broken_files_or_rules) > 0:
+                    f.write(f" AND {len(duplicates)} duplicate rule name(s) found")
+                else:
+                    f.write(f"**Status:** ⚠️ {len(duplicates)} duplicate rule name(s) found")
+            f.write("\n\n")
+        
+        # Deduplication report
+        if dedup_tracker:
+            stats = dedup_tracker.get_statistics()
+            if stats['total_duplicates'] > 0:
+                f.write("## 🔄 Deduplication Report\n\n")
+                f.write(f"**Total Duplicates Found:** {stats['total_duplicates']}\n\n")
+                
+                if dedup_tracker.renames:
+                    f.write(f"### 📝 Renamed Rules ({len(dedup_tracker.renames)})\n\n")
+                    for rename in dedup_tracker.renames:
+                        f.write(f"#### `{rename['original_name']}` → `{rename['new_name']}`\n\n")
+                        f.write(f"- **File:** `{rename['file']}`\n")
+                        f.write(f"- **Reason:** {rename['reason']}\n\n")
+                
+                if dedup_tracker.removals:
+                    content_dupes = [r for r in dedup_tracker.removals if r.get('duplicate_type') == 'content_duplicate']
+                    true_dupes = [r for r in dedup_tracker.removals if r.get('duplicate_type') == 'true_duplicate']
+                    
+                    if content_dupes:
+                        f.write(f"### 📋 Content Duplicates ({len(content_dupes)})\n\n")
+                        for removal in content_dupes:
+                            f.write(f"#### `{removal['rule_name']}`\n\n")
+                            f.write(f"- **File:** `{removal['file']}`\n")
+                            f.write(f"- **Identical To:** `{removal['original_name']}`\n")
+                            f.write(f"- **Reason:** {removal['reason']}\n\n")
+                    
+                    if true_dupes:
+                        f.write(f"### 🗑️ True Duplicates ({len(true_dupes)})\n\n")
+                        for removal in true_dupes:
+                            f.write(f"#### `{removal['rule_name']}`\n\n")
+                            f.write(f"- **File:** `{removal['file']}`\n")
+                            f.write(f"- **Reason:** {removal['reason']}\n\n")
+                
+                f.write("---\n\n")
+        
+        # Duplicate rules warning (if no dedup)
+        if not dedup_tracker and duplicates:
+            f.write("## ⚠️ Duplicate Rule Names\n\n")
+            f.write("**CRITICAL:** YARA requires all rule names to be unique.\n\n")
+            
+            for rule_name, item_list in sorted(duplicates.items()):
+                count = len(item_list)
+                f.write(f"### ⚠️ `{rule_name}` (appears {count} times)\n\n")
+                if mode == 'file':
+                    for filepath in item_list:
+                        f.write(f"- `{filepath}`\n")
+                else:
+                    for rule in item_list:
+                        f.write(f"- `{rule.source_file}`\n")
+                f.write("\n")
+            
+            f.write("**💡 Recommendation:** Use `--deduplicate` flag.\n\n")
+            f.write("---\n\n")
+        
+        # Valid items
+        if valid_files_or_rules:
+            f.write(f"## ✅ Valid {'Files' if mode == 'file' else 'Rules'}\n\n")
+            for item in valid_files_or_rules:
+                if mode == 'file':
+                    suffix = " *(deduplicated)*" if item.was_deduplicated else ""
+                    f.write(f"- **{item.filename}** ({item.rule_count} rule(s)){suffix} - `{item.filepath}`\n")
+                else:
+                    suffix = ""
+                    if item.was_renamed:
+                        suffix = f" *(renamed from `{item.original_name}`)*"
+                    f.write(f"- **{item.rule_name}**{suffix} - `{item.source_file}`\n")
+            f.write("\n")
+        
+        # Broken items
+        if broken_files_or_rules:
+            f.write(f"## ❌ Broken {'Files' if mode == 'file' else 'Rules'}\n\n")
+            for i, item in enumerate(broken_files_or_rules, 1):
+                if mode == 'file':
+                    f.write(f"### {i}. {item.filename}\n\n")
+                    f.write(f"- **Path:** `{item.filepath}`\n")
+                    f.write(f"- **Rules:** {item.rule_count}\n")
+                else:
+                    f.write(f"### {i}. {item.rule_name}\n\n")
+                    f.write(f"- **Source:** `{item.source_file}`\n")
+                
+                f.write(f"- **Error:**\n")
+                f.write("```\n")
+                f.write(f"{item.error_data}\n")
+                f.write("```\n\n")
+                
+                # Show content preview
+                if mode == 'file' and item.content:
+                    f.write("<details>\n")
+                    f.write("<summary>View file content (first 20 lines)</summary>\n\n")
+                    f.write("```yara\n")
+                    lines = item.content.split('\n')
+                    for line_num, line in enumerate(lines[:20], 1):
+                        f.write(f"{line_num:4d}: {line}\n")
+                    if len(lines) > 20:
+                        f.write(f"... ({len(lines) - 20} more lines)\n")
+                    f.write("```\n")
+                    f.write("</details>\n\n")
+                elif mode == 'split':
+                    f.write("<details>\n")
+                    f.write("<summary>View rule source</summary>\n\n")
+                    f.write("```yara\n")
+                    full_source = item.get_full_source()
+                    lines = full_source.split('\n')
+                    for line_num, line in enumerate(lines[:30], 1):
+                        f.write(f"{line_num:4d}: {line}\n")
+                    if len(lines) > 30:
+                        f.write(f"... ({len(lines) - 30} more lines)\n")
+                    f.write("```\n")
+                    f.write("</details>\n\n")
+                
+                f.write("---\n\n")
 
 
 # ============================================================================
@@ -1176,7 +1331,7 @@ def write_invalid_metadata_rules(rules, output_dir):
 # ============================================================================
 
 def validate_files_mode(directory, verbose=False, enable_deduplication=False, require_metadata=False,
-                       output_valid_dir=None, output_failed_dir=None, output_invalid_metadata_dir=None,
+                       output_valid_dir=None, output_failed_dir=None,
                        json_report=None, markdown_report=None):
     """Validate entire files (default mode)."""
     
@@ -1207,7 +1362,7 @@ def validate_files_mode(directory, verbose=False, enable_deduplication=False, re
     
     if not yara_files:
         print(f"\n❌ No YARA rule files found in {directory}")
-        return 0, 0, 0
+        return 0, 0
     
     print(f"\n📁 Found {len(yara_files)} YARA file(s)")
     
@@ -1228,17 +1383,15 @@ def validate_files_mode(directory, verbose=False, enable_deduplication=False, re
     if require_metadata:
         print("    (Checking metadata requirements...)")
     
-    valid_files, broken_files, invalid_metadata_files = validator.validate_all()
+    valid_files, broken_files = validator.validate_all()
     duplicates = validator.get_duplicate_rules()
-    total_rules = sum(f.rule_count for f in valid_files + broken_files + invalid_metadata_files)
+    total_rules = sum(f.rule_count for f in valid_files + broken_files)
     
     print("\n" + "="*80)
     print("VALIDATION RESULTS")
     print("="*80)
     print(f"✅ Valid files:           {len(valid_files)}")
     print(f"❌ Broken files:          {len(broken_files)}")
-    if require_metadata:
-        print(f"⚠️  Invalid metadata:      {len(invalid_metadata_files)}")
     print(f"📊 Total rules:           {total_rules}")
     
     if not enable_deduplication and duplicates:
@@ -1253,17 +1406,21 @@ def validate_files_mode(directory, verbose=False, enable_deduplication=False, re
     
     print("="*80)
     
-    if require_metadata and invalid_metadata_files and verbose:
-        print("\n" + "="*80)
-        print(f"⚠️  INVALID METADATA DETAILS ({len(invalid_metadata_files)} files)")
-        print("="*80)
-        for yara_file in invalid_metadata_files:
-            print(f"\n📄 {yara_file.filename}:")
-            for rule_error in yara_file.metadata_errors:
-                print(f"   Rule '{rule_error['rule_name']}':")
-                for err in rule_error['errors']:
-                    print(f"      • {err['message']}")
-        print("="*80)
+    # Show metadata error details in verbose mode
+    if require_metadata and verbose and broken_files:
+        has_metadata_errors = any(f.metadata_errors for f in broken_files)
+        if has_metadata_errors:
+            print("\n" + "="*80)
+            print(f"⚠️  METADATA VALIDATION FAILURES")
+            print("="*80)
+            for yara_file in broken_files:
+                if yara_file.metadata_errors:
+                    print(f"\n📄 {yara_file.filename}:")
+                    for rule_error in yara_file.metadata_errors:
+                        print(f"   Rule '{rule_error['rule_name']}':")
+                        for err in rule_error['errors']:
+                            print(f"      • {err['message']}")
+            print("="*80)
     
     if output_valid_dir and valid_files:
         print(f"\n📝 Writing valid files to: {output_valid_dir}")
@@ -1275,23 +1432,39 @@ def validate_files_mode(directory, verbose=False, enable_deduplication=False, re
         written = write_failed_files(broken_files, output_failed_dir)
         print(f"   Wrote {len(written)} file(s)")
     
-    if output_invalid_metadata_dir and invalid_metadata_files:
-        print(f"\n📝 Writing files with invalid metadata to: {output_invalid_metadata_dir}")
-        written = write_invalid_metadata_files(invalid_metadata_files, output_invalid_metadata_dir)
-        print(f"   Wrote {len(written)} file(s)")
+    if json_report:
+        print(f"\n📝 Generating JSON report: {json_report}")
+        dedup_data = validator.get_deduplication_report().to_dict() if enable_deduplication else None
+        generate_json_report(valid_files, broken_files, duplicates, dedup_data, 
+                           json_report, mode='file', require_metadata=require_metadata)
+    
+    if markdown_report:
+        print(f"\n📝 Generating Markdown report: {markdown_report}")
+        dedup_data = validator.get_deduplication_report() if enable_deduplication else None
+        generate_markdown_report(valid_files, broken_files, duplicates, dedup_data, 
+                               markdown_report, mode='file', require_metadata=require_metadata)
     
     print("\n" + "="*80)
-    if broken_files or invalid_metadata_files:
-        print(f"⚠️  Validation completed with {len(broken_files) + len(invalid_metadata_files)} failure(s)")
+    if broken_files:
+        print(f"⚠️  Validation completed with {len(broken_files)} failure(s)")
     else:
         print("✅ All files validated successfully!")
+    
+    if enable_deduplication:
+        dedup_report = validator.get_deduplication_report()
+        if dedup_report:
+            stats = dedup_report.get_statistics()
+            print(f"🔄 Deduplication: {stats['renames']} renamed, {stats['removals']} removed")
+            if stats['content_duplicates'] > 0:
+                print(f"📋 Content duplicates: {stats['content_duplicates']}")
+    
     print("="*80)
     
-    return len(valid_files), len(broken_files), len(invalid_metadata_files)
+    return len(valid_files), len(broken_files)
 
 
 def validate_split_mode(directory, verbose=False, enable_deduplication=False, require_metadata=False,
-                       output_valid_dir=None, output_failed_dir=None, output_invalid_metadata_dir=None,
+                       output_valid_dir=None, output_failed_dir=None,
                        json_report=None, markdown_report=None):
     """Validate individual rules (split mode)."""
     
@@ -1322,7 +1495,7 @@ def validate_split_mode(directory, verbose=False, enable_deduplication=False, re
     
     if not yara_files:
         print(f"\n❌ No YARA rule files found in {directory}")
-        return 0, 0, 0
+        return 0, 0
     
     print(f"\n📁 Found {len(yara_files)} YARA file(s)")
     
@@ -1342,7 +1515,7 @@ def validate_split_mode(directory, verbose=False, enable_deduplication=False, re
     print(f"\n📊 Total rules parsed: {total_rules}")
     
     print("\n🔍 Validating rules...")
-    valid_rules, broken_rules, invalid_metadata_rules = validator.validate_all()
+    valid_rules, broken_rules = validator.validate_all()
     duplicates = validator.get_duplicate_rules() if not enable_deduplication else {}
     
     print("\n" + "="*80)
@@ -1350,23 +1523,25 @@ def validate_split_mode(directory, verbose=False, enable_deduplication=False, re
     print("="*80)
     print(f"✅ Valid rules:           {len(valid_rules)}")
     print(f"❌ Broken rules:          {len(broken_rules)}")
-    if require_metadata:
-        print(f"⚠️  Invalid metadata:      {len(invalid_metadata_rules)}")
     
     if not enable_deduplication and duplicates:
         print(f"⚠️  Duplicate rule names:  {len(duplicates)}")
     
     print("="*80)
     
-    if require_metadata and invalid_metadata_rules and verbose:
-        print("\n" + "="*80)
-        print(f"⚠️  INVALID METADATA DETAILS ({len(invalid_metadata_rules)} rules)")
-        print("="*80)
-        for rule in invalid_metadata_rules:
-            print(f"\n📜 {rule.rule_name}:")
-            for err in rule.metadata_errors:
-                print(f"   • {err}")
-        print("="*80)
+    # Show metadata error details in verbose mode
+    if require_metadata and verbose and broken_rules:
+        has_metadata_errors = any(r.metadata_errors for r in broken_rules)
+        if has_metadata_errors:
+            print("\n" + "="*80)
+            print(f"⚠️  METADATA VALIDATION FAILURES")
+            print("="*80)
+            for rule in broken_rules:
+                if rule.metadata_errors:
+                    print(f"\n📜 {rule.rule_name}:")
+                    for err in rule.metadata_errors:
+                        print(f"   • {err}")
+            print("="*80)
     
     if output_valid_dir and valid_rules:
         print(f"\n📝 Writing valid rules to: {output_valid_dir}")
@@ -1378,19 +1553,26 @@ def validate_split_mode(directory, verbose=False, enable_deduplication=False, re
         written = write_failed_rules(broken_rules, output_failed_dir)
         print(f"   Wrote {len(written)} file(s)")
     
-    if output_invalid_metadata_dir and invalid_metadata_rules:
-        print(f"\n📝 Writing rules with invalid metadata to: {output_invalid_metadata_dir}")
-        written = write_invalid_metadata_rules(invalid_metadata_rules, output_invalid_metadata_dir)
-        print(f"   Wrote {len(written)} file(s)")
+    if json_report:
+        print(f"\n📝 Generating JSON report: {json_report}")
+        dedup_data = validator.get_deduplication_report().to_dict() if enable_deduplication else None
+        generate_json_report(valid_rules, broken_rules, duplicates, dedup_data, 
+                           json_report, mode='split', require_metadata=require_metadata)
+    
+    if markdown_report:
+        print(f"\n📝 Generating Markdown report: {markdown_report}")
+        dedup_data = validator.get_deduplication_report() if enable_deduplication else None
+        generate_markdown_report(valid_rules, broken_rules, duplicates, dedup_data, 
+                               markdown_report, mode='split', require_metadata=require_metadata)
     
     print("\n" + "="*80)
-    if broken_rules or invalid_metadata_rules:
-        print(f"⚠️  Validation completed with {len(broken_rules) + len(invalid_metadata_rules)} failure(s)")
+    if broken_rules:
+        print(f"⚠️  Validation completed with {len(broken_rules)} failure(s)")
     else:
         print("✅ All rules validated successfully!")
     print("="*80)
     
-    return len(valid_rules), len(broken_rules), len(invalid_metadata_rules)
+    return len(valid_rules), len(broken_rules)
 
 
 # ============================================================================
@@ -1468,10 +1650,7 @@ EXAMPLES:
                        help='Output directory for valid files/rules')
     
     parser.add_argument('--output-failed-dir', metavar='DIR',
-                       help='Output directory for failed files/rules')
-    
-    parser.add_argument('--output-invalid-metadata-dir', metavar='DIR',
-                       help='Output directory for files/rules with invalid metadata')
+                       help='Output directory for failed files/rules (syntax or metadata errors)')
     
     parser.add_argument('--json-report', metavar='FILE',
                        help='Generate JSON report')
@@ -1508,26 +1687,24 @@ EXAMPLES:
     
     try:
         if args.split_rules:
-            valid_count, broken_count, invalid_metadata_count = validate_split_mode(
+            valid_count, broken_count = validate_split_mode(
                 args.directory,
                 verbose=args.verbose,
                 enable_deduplication=args.deduplicate,
                 require_metadata=args.require_metadata,
                 output_valid_dir=args.output_valid_dir,
                 output_failed_dir=args.output_failed_dir,
-                output_invalid_metadata_dir=args.output_invalid_metadata_dir,
                 json_report=args.json_report,
                 markdown_report=args.markdown_report
             )
         else:
-            valid_count, broken_count, invalid_metadata_count = validate_files_mode(
+            valid_count, broken_count = validate_files_mode(
                 args.directory,
                 verbose=args.verbose,
                 enable_deduplication=args.deduplicate,
                 require_metadata=args.require_metadata,
                 output_valid_dir=args.output_valid_dir,
                 output_failed_dir=args.output_failed_dir,
-                output_invalid_metadata_dir=args.output_invalid_metadata_dir,
                 json_report=args.json_report,
                 markdown_report=args.markdown_report
             )
@@ -1535,7 +1712,7 @@ EXAMPLES:
         # Exit codes
         if valid_count == 0:
             sys.exit(2)
-        elif broken_count > 0 or invalid_metadata_count > 0:
+        elif broken_count > 0:
             sys.exit(1)
         else:
             sys.exit(0)
