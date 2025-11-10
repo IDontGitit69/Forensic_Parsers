@@ -26,55 +26,35 @@ class YaraRuleParser:
         # Remove comments
         content = self._remove_comments(content)
         
-        # Find all rule definitions using a more robust approach
-        # Split by 'rule' keyword and process each potential rule
-        self._extract_rules(content)
+        # Find all rule definitions
+        # Use a simpler approach that handles nested braces properly
+        rule_pattern = r'rule\s+(\w+)\s*(?::\s*[\w\s]+)?\s*\{'
         
-        # Extract dependencies from each rule
-        for rule_name, rule_body in self.rules.items():
+        matches = list(re.finditer(rule_pattern, content, re.DOTALL))
+        
+        for i, match in enumerate(matches):
+            rule_name = match.group(1)
+            rule_start = match.end()
+            
+            # Find the matching closing brace for this rule
+            brace_count = 1
+            pos = rule_start
+            
+            while pos < len(content) and brace_count > 0:
+                if content[pos] == '{':
+                    brace_count += 1
+                elif content[pos] == '}':
+                    brace_count -= 1
+                pos += 1
+            
+            rule_body = content[rule_start:pos-1]
+            self.rules[rule_name] = rule_body
+            
+            # Extract dependencies from the condition section
             dependencies = self._extract_dependencies(rule_body, rule_name)
+            
             if dependencies:
                 self.dependencies[rule_name] = dependencies
-    
-    def _extract_rules(self, content: str):
-        """Extract rules from content by finding rule blocks."""
-        # Pattern to find rule declarations
-        pos = 0
-        while True:
-            # Find next 'rule' keyword
-            rule_match = re.search(r'\brule\s+(\w+)', content[pos:], re.IGNORECASE)
-            if not rule_match:
-                break
-            
-            rule_name = rule_match.group(1)
-            rule_start = pos + rule_match.end()
-            
-            # Find the opening brace
-            brace_match = re.search(r'\{', content[rule_start:])
-            if not brace_match:
-                break
-            
-            brace_start = rule_start + brace_match.start()
-            
-            # Find the matching closing brace
-            brace_count = 0
-            i = brace_start
-            rule_body_start = i + 1
-            
-            while i < len(content):
-                if content[i] == '{':
-                    brace_count += 1
-                elif content[i] == '}':
-                    brace_count -= 1
-                    if brace_count == 0:
-                        rule_body = content[rule_body_start:i]
-                        self.rules[rule_name] = rule_body
-                        pos = i + 1
-                        break
-                i += 1
-            else:
-                # Reached end without closing brace
-                break
     
     def _remove_comments(self, content: str) -> str:
         """Remove single-line and multi-line comments from YARA content."""
@@ -96,16 +76,15 @@ class YaraRuleParser:
         
         condition = condition_match.group(1)
         
-        # YARA keywords to exclude from rule name matching
+        # YARA keywords and functions to exclude from rule name matching
         yara_keywords = {
             'all', 'any', 'them', 'for', 'of', 'in', 'and', 'or', 'not',
             'true', 'false', 'defined', 'uint8', 'uint16', 'uint32', 'uint64',
             'int8', 'int16', 'int32', 'int64', 'filesize', 'entrypoint',
-            'at', 'none'
+            'at', 'none', 'pe', 'elf', 'math', 'hash'
         }
         
-        # Pattern to match potential rule names
-        # This will match any identifier that looks like it could be a rule name
+        # Pattern to match potential rule names (any valid identifier)
         rule_ref_pattern = r'\b([a-zA-Z_]\w*)\b'
         
         for match in re.finditer(rule_ref_pattern, condition):
@@ -120,11 +99,11 @@ class YaraRuleParser:
                 continue
             
             # Skip if it looks like a variable reference (starts with $)
-            # Note: the pattern doesn't capture $, but we check context
             start_pos = match.start()
             if start_pos > 0 and condition[start_pos - 1] == '$':
                 continue
             
+            # Add as potential dependency - will be validated later
             dependencies.add(potential_rule)
         
         return dependencies
