@@ -26,20 +26,55 @@ class YaraRuleParser:
         # Remove comments
         content = self._remove_comments(content)
         
-        # Find all rule definitions
-        rule_pattern = r'rule\s+(\w+)\s*(?::\s*[\w\s]+)?\s*\{([^}]*(?:\{[^}]*\}[^}]*)*)\}'
+        # Find all rule definitions using a more robust approach
+        # Split by 'rule' keyword and process each potential rule
+        self._extract_rules(content)
         
-        for match in re.finditer(rule_pattern, content, re.DOTALL):
-            rule_name = match.group(1)
-            rule_body = match.group(2)
-            
-            self.rules[rule_name] = rule_body
-            
-            # Extract dependencies from the condition section
+        # Extract dependencies from each rule
+        for rule_name, rule_body in self.rules.items():
             dependencies = self._extract_dependencies(rule_body, rule_name)
-            
             if dependencies:
                 self.dependencies[rule_name] = dependencies
+    
+    def _extract_rules(self, content: str):
+        """Extract rules from content by finding rule blocks."""
+        # Pattern to find rule declarations
+        pos = 0
+        while True:
+            # Find next 'rule' keyword
+            rule_match = re.search(r'\brule\s+(\w+)', content[pos:], re.IGNORECASE)
+            if not rule_match:
+                break
+            
+            rule_name = rule_match.group(1)
+            rule_start = pos + rule_match.end()
+            
+            # Find the opening brace
+            brace_match = re.search(r'\{', content[rule_start:])
+            if not brace_match:
+                break
+            
+            brace_start = rule_start + brace_match.start()
+            
+            # Find the matching closing brace
+            brace_count = 0
+            i = brace_start
+            rule_body_start = i + 1
+            
+            while i < len(content):
+                if content[i] == '{':
+                    brace_count += 1
+                elif content[i] == '}':
+                    brace_count -= 1
+                    if brace_count == 0:
+                        rule_body = content[rule_body_start:i]
+                        self.rules[rule_name] = rule_body
+                        pos = i + 1
+                        break
+                i += 1
+            else:
+                # Reached end without closing brace
+                break
     
     def _remove_comments(self, content: str) -> str:
         """Remove single-line and multi-line comments from YARA content."""
@@ -61,18 +96,36 @@ class YaraRuleParser:
         
         condition = condition_match.group(1)
         
-        # Pattern to match rule references in conditions
-        # Matches: rule_name, rule_name(), rule_name[index]
-        # Excludes: keywords like 'all', 'any', 'them', 'for', 'of', 'in', etc.
-        rule_ref_pattern = r'\b(?!(?:all|any|them|for|of|in|and|or|not|true|false|defined|uint8|uint16|uint32|int8|int16|int32|filesize|entrypoint|at|in)\b)([a-zA-Z_]\w*)(?:\s*\(|\s*\[|\s*(?=\s|$|and|or|not|\)))'
+        # YARA keywords to exclude from rule name matching
+        yara_keywords = {
+            'all', 'any', 'them', 'for', 'of', 'in', 'and', 'or', 'not',
+            'true', 'false', 'defined', 'uint8', 'uint16', 'uint32', 'uint64',
+            'int8', 'int16', 'int32', 'int64', 'filesize', 'entrypoint',
+            'at', 'none'
+        }
+        
+        # Pattern to match potential rule names
+        # This will match any identifier that looks like it could be a rule name
+        rule_ref_pattern = r'\b([a-zA-Z_]\w*)\b'
         
         for match in re.finditer(rule_ref_pattern, condition):
             potential_rule = match.group(1)
             
-            # Check if this is actually a rule name (exists in the file)
-            # We'll collect all potential references and validate later
-            if potential_rule != current_rule:
-                dependencies.add(potential_rule)
+            # Skip if it's a YARA keyword
+            if potential_rule.lower() in yara_keywords:
+                continue
+            
+            # Skip if it's the current rule (self-reference)
+            if potential_rule == current_rule:
+                continue
+            
+            # Skip if it looks like a variable reference (starts with $)
+            # Note: the pattern doesn't capture $, but we check context
+            start_pos = match.start()
+            if start_pos > 0 and condition[start_pos - 1] == '$':
+                continue
+            
+            dependencies.add(potential_rule)
         
         return dependencies
     
