@@ -547,6 +547,11 @@ class FileValidator:
             
             rule_name = rule_name_match.group(1)
             
+
+
+            fingerprint = RuleFingerprint(rule_source)
+            print(f" DEBUG: Processing rule '{rule_name}' with hash {fingerprint.hash[:16]}")
+            
             # Register and check for duplicates
             should_keep, new_name, duplicate_info = self.dedup_tracker.register_rule(
                 rule_name,
@@ -1456,17 +1461,17 @@ def generate_rule_markdown_report_with_dedup(valid_rules, broken_rules, duplicat
                         f.write(f"- **Content Hash:** `{removal['hash']}`\n")
                         f.write(f"- **Note:** The rule body (strings, meta, condition) was **100% identical** to the original rule, only the rule name was different.\n\n")
 
-                    # True duplicates (same name AND content)
-                    true_dupes = [r for r in dedup_tracker.removals if r.get('duplicate_type') == 'true_duplicate']
-                    if true_dupes:
-                        f.write(f"### 🗑️ True Duplicates ({len(true_dupes)})\n\n")
-                        f.write("The following rules were exact duplicates (identical name AND content) and were removed:\n\n")
-                        
-                        for removal in true_dupes:
-                            f.write(f"#### `{removal['rule_name']}`\n\n")
-                            f.write(f"- **File:** `{removal['file']}`\n")
-                            f.write(f"- **Reason:** {removal['reason']}\n")
-                            f.write(f"- **Hash:** `{removal['hash']}`\n\n")                        
+                # True duplicates (same name AND content)
+                true_dupes = [r for r in dedup_tracker.removals if r.get('duplicate_type') == 'true_duplicate']
+                if true_dupes:
+                    f.write(f"### 🗑️ True Duplicates ({len(true_dupes)})\n\n")
+                    f.write("The following rules were exact duplicates (identical name AND content) and were removed:\n\n")
+                    
+                    for removal in true_dupes:
+                        f.write(f"#### `{removal['rule_name']}`\n\n")
+                        f.write(f"- **File:** `{removal['file']}`\n")
+                        f.write(f"- **Reason:** {removal['reason']}\n")
+                        f.write(f"- **Hash:** `{removal['hash']}`\n\n")                        
 
                 # Renamed rules
                 if dedup_tracker.renames:
@@ -1480,7 +1485,7 @@ def generate_rule_markdown_report_with_dedup(valid_rules, broken_rules, duplicat
                         f.write(f"- **Original Hash:** `{rename['original_hash']}`\n")
                         f.write(f"- **New Hash:** `{rename['new_hash']}`\n\n")
                 
-                # Removed duplicates
+                """# Removed duplicates
                 if dedup_tracker.removals:
                     f.write(f"### 🗑️ Removed Duplicates ({len(dedup_tracker.removals)})\n\n")
                     f.write("The following rules were true duplicates (identical content) and were removed:\n\n")
@@ -1489,7 +1494,7 @@ def generate_rule_markdown_report_with_dedup(valid_rules, broken_rules, duplicat
                         f.write(f"#### `{removal['rule_name']}`\n\n")
                         f.write(f"- **File:** `{removal['file']}`\n")
                         f.write(f"- **Reason:** {removal['reason']}\n")
-                        f.write(f"- **Hash:** `{removal['hash']}`\n\n")
+                        f.write(f"- **Hash:** `{removal['hash']}`\n\n")"""
                 
                 f.write("---\n\n")
         
@@ -1641,7 +1646,6 @@ def validate_files_mode(directory, verbose=False, enable_deduplication=False, ou
                     print(f"     Reason: {removal['reason']}")
                     print(f"     Hash: {removal['hash']}")
                     print()
-
 
             if dedup_report.renames:
                 print(f"\n📝 RENAMED RULES ({len(dedup_report.renames)}):\n")
