@@ -1,51 +1,57 @@
 # GitLab CI/CD Pipeline for YARA Rule Validation and Deployment
-
+ 
 stages:
   - validate
-  - report
-  - merge
-  - deploy
+  - push
 
 variables:
   # Directories
-  NEW_RULES_DIR: "YARA_Rules/new_rules"
-  VALIDATED_DIR: "validated"
-  FAILED_DIR: "failed"
-  BASELINE_FILE: "YARA_Rules/master_rules.yar"
+  NEW_RULES_DIR: "Yara Rules/New Rules"
+  VALIDATED_DIR: "Yara Rules/validated"
+  FAILED_DIR: "Yara Rules/failed"
+  BASELINE_FILE: "Yara Rules/Master_Rules_List.yar"
+  GIT_DEPTH: 0
   
   # Report files
-  JSON_REPORT: "validation_report.json"
-  MD_REPORT: "validation_report.md"
-  
+  JSON_REPORT: "Yara Rules/validation_report.json"
+  MD_REPORT: "Yara Rules/validation_report.md"
+ 
   # Python image
   PYTHON_IMAGE: "python:3.11-slim"
-
+ 
 # Template for Python setup
 .python_setup: &python_setup
   before_script:
-    - pip install --quiet --no-cache-dir yara-python
-    - python --version
-    - python -c "import yara; print(f'YARA version: {yara.__version__}')"
-
+    - pip3 install --quiet --no-cache-dir yara-python
+    - python3 --version
+    - "python3 -c \"import yara; print(f'YARA version: {yara.__version__}')\""
+ 
 # ==============================================================================
 # STAGE 1: VALIDATE
 # ==============================================================================
-
 validate_yara_rules:
   stage: validate
+  rules:
+    - changes:
+        - "$NEW_RULES_DIR/**"
+      when: on_success
+    - when: never
   image: $PYTHON_IMAGE
+  tags:
+    - yaralyzer
   <<: *python_setup
   script:
     - echo "🔍 Validating YARA rules in $NEW_RULES_DIR"
     - |
-      python scripts/validate_yara_rules.py "$NEW_RULES_DIR" \
+      python3 "Yara Rules/Tools/Yaralyzer.py" "$NEW_RULES_DIR" \
         --output-valid-dir "$VALIDATED_DIR" \
         --output-failed-dir "$FAILED_DIR" \
         --json-report "$JSON_REPORT" \
         --markdown-report "$MD_REPORT" \
-        --accept-repairs \
-        --verbose
-  
+        --deduplicate \
+        --verbose \
+        --require-metadata
+ 
   artifacts:
     when: always
     paths:
@@ -53,395 +59,62 @@ validate_yara_rules:
       - $FAILED_DIR/
       - $JSON_REPORT
       - $MD_REPORT
-    reports:
-      # GitLab can parse this for MR comments
-      coverage_report:
-        coverage_format: cobertura
-        path: $JSON_REPORT
     expire_in: 7 days
-  
-  # Allow pipeline to continue even if validation fails
-  # so we can generate reports
+ 
   allow_failure: true
-  
-  rules:
-    # Run on merge requests
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-    # Run on main/master branch
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-    # Run on manual trigger
-    - if: '$CI_PIPELINE_SOURCE == "web"'
-
+ 
 # ==============================================================================
-# STAGE 2: REPORT
+# STAGE 2: PUSH
 # ==============================================================================
-
-generate_report:
-  stage: report
-  image: $PYTHON_IMAGE
-  dependencies:
-    - validate_yara_rules
-  script:
-    - echo "📊 Generating validation report"
-    
-    # Print summary from JSON report
-    - |
-      python3 << EOF
-      import json
-      import sys
-      
-      try:
-          with open('$JSON_REPORT', 'r') as f:
-              report = json.load(f)
-          
-          summary = report['summary']
-          print("\n" + "="*80)
-          print("VALIDATION SUMMARY")
-          print("="*80)
-          print(f"Total Rules:     {summary['total']}")
-          print(f"Valid Rules:     {summary['valid']}")
-          print(f"Broken Rules:    {summary['broken']}")
-          print(f"Repaired Rules:  {summary['repaired']}")
-          print(f"Success Rate:    {summary['success_rate']}%")
-          print("="*80 + "\n")
-          
-          # Exit with error if there are broken rules
-          if summary['broken'] > 0:
-              print(f"❌ {summary['broken']} rule(s) failed validation")
-              sys.exit(1)
-          else:
-              print("✅ All rules passed validation")
-              sys.exit(0)
-      except Exception as e:
-          print(f"Error reading report: {e}")
-          sys.exit(1)
-      EOF
-    
-    # Display markdown report
-    - |
-      if [ -f "$MD_REPORT" ]; then
-        echo "📝 Markdown Report:"
-        cat "$MD_REPORT"
-      fi
-    
-    # List failed rules
-    - |
-      if [ -d "$FAILED_DIR" ] && [ "$(ls -A $FAILED_DIR)" ]; then
-        echo ""
-        echo "❌ FAILED RULES:"
-        ls -1 "$FAILED_DIR"
-      fi
-  
-  artifacts:
-    when: always
-    reports:
-      # This creates a downloadable report in GitLab UI
-      dotenv: report.env
-    expire_in: 7 days
-  
-  # This job should fail if validation failed
-  allow_failure: false
-  
-  rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-    - if: '$CI_PIPELINE_SOURCE == "web"'
-
-# Post report as MR comment (requires GitLab Premium)
-post_mr_comment:
-  stage: report
-  image: $PYTHON_IMAGE
-  dependencies:
-    - validate_yara_rules
-  script:
-    - |
-      if [ -f "$MD_REPORT" ]; then
-        # You can use GitLab API to post comment
-        # Requires GITLAB_TOKEN with api scope
-        if [ -n "$CI_MERGE_REQUEST_IID" ] && [ -n "$GITLAB_TOKEN" ]; then
-          pip install --quiet requests
-          python3 << EOF
-      import requests
-      import os
-      
-      with open('$MD_REPORT', 'r') as f:
-          report_body = f.read()
-      
-      url = f"{os.environ['CI_API_V4_URL']}/projects/{os.environ['CI_PROJECT_ID']}/merge_requests/{os.environ['CI_MERGE_REQUEST_IID']}/notes"
-      headers = {"PRIVATE-TOKEN": os.environ['GITLAB_TOKEN']}
-      data = {"body": report_body}
-      
-      response = requests.post(url, headers=headers, json=data)
-      if response.ok:
-          print("✅ Posted report to merge request")
-      else:
-          print(f"⚠️ Failed to post comment: {response.status_code}")
-      EOF
-        fi
-      fi
-  
-  rules:
-    - if: '$CI_MERGE_REQUEST_IID && $GITLAB_TOKEN'
-  
-  allow_failure: true
-
-# ==============================================================================
-# STAGE 3: MERGE
-# ==============================================================================
-
-merge_valid_rules:
-  stage: merge
-  image: $PYTHON_IMAGE
-  <<: *python_setup
-  dependencies:
-    - validate_yara_rules
-  script:
-    - echo "🔀 Merging validated rules into baseline"
-    
-    # Check if we have any validated rules
-    - |
-      if [ ! -d "$VALIDATED_DIR" ] || [ ! "$(ls -A $VALIDATED_DIR)" ]; then
-        echo "❌ No validated rules to merge"
-        exit 1
-      fi
-    
-    # Count validated rules
-    - |
-      RULE_COUNT=$(ls -1 "$VALIDATED_DIR" | wc -l)
-      echo "📝 Found $RULE_COUNT validated rule(s) to merge"
-    
-    # Create combined output file
-    - mkdir -p baseline
-    - |
-      python3 << EOF
-      import os
-      import glob
-      from datetime import datetime
-      
-      output_file = 'baseline/master_rules_updated.yar'
-      validated_dir = '$VALIDATED_DIR'
-      baseline_file = '$BASELINE_FILE'
-      
-      # Start with header
-      with open(output_file, 'w') as out:
-          out.write("/*\n")
-          out.write(" * Combined YARA Rules\n")
-          out.write(f" * Generated: {datetime.now().isoformat()}\n")
-          out.write(f" * Pipeline: {os.environ.get('CI_PIPELINE_ID', 'unknown')}\n")
-          out.write(f" * Commit: {os.environ.get('CI_COMMIT_SHORT_SHA', 'unknown')}\n")
-          out.write(" */\n\n")
-          
-          # Include baseline if it exists
-          if os.path.exists(baseline_file):
-              print(f"📝 Including baseline from {baseline_file}")
-              with open(baseline_file, 'r') as baseline:
-                  out.write("// ========== BASELINE RULES ==========\n\n")
-                  out.write(baseline.read())
-                  out.write("\n\n")
-          
-          # Add validated rules
-          out.write("// ========== NEWLY VALIDATED RULES ==========\n\n")
-          
-          for rule_file in sorted(glob.glob(os.path.join(validated_dir, '*'))):
-              if os.path.isfile(rule_file):
-                  print(f"📝 Adding {os.path.basename(rule_file)}")
-                  with open(rule_file, 'r') as f:
-                      out.write(f"// Source: {os.path.basename(rule_file)}\n")
-                      out.write(f.read())
-                      out.write("\n\n")
-      
-      print(f"✅ Created combined ruleset: {output_file}")
-      EOF
-    
-    # Validate the combined ruleset
-    - echo "🔍 Validating combined ruleset..."
-    - |
-      python3 << EOF
-      import yara
-      import sys
-      
-      try:
-          rules = yara.compile(filepath='baseline/master_rules_updated.yar')
-          print("✅ Combined ruleset is valid")
-          sys.exit(0)
-      except yara.Error as e:
-          print(f"❌ Combined ruleset validation failed: {e}")
-          sys.exit(1)
-      EOF
-  
-  artifacts:
-    paths:
-      - baseline/master_rules_updated.yar
-    expire_in: 30 days
-  
-  # Only merge if validation passed
-  rules:
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-      when: on_success
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-      when: manual
-  
+push_to_repo:
+  stage: push
   needs:
     - job: validate_yara_rules
       artifacts: true
-    - job: generate_report
-      artifacts: false
-
-# ==============================================================================
-# STAGE 4: DEPLOY
-# ==============================================================================
-
-deploy_to_production:
-  stage: deploy
-  image: $PYTHON_IMAGE
-  dependencies:
-    - merge_valid_rules
-  script:
-    - echo "🚀 Deploying rules to production"
-    
-    # Example: Copy to production directory
-    - |
-      if [ -f "baseline/master_rules_updated.yar" ]; then
-        cp baseline/master_rules_updated.yar "$BASELINE_FILE"
-        echo "✅ Deployed to $BASELINE_FILE"
-      else
-        echo "❌ No rules to deploy"
-        exit 1
-      fi
-    
-    # Example: Commit back to repository (optional)
-    # Requires CI/CD variable GIT_PUSH_TOKEN with write access
-    - |
-      if [ -n "$GIT_PUSH_TOKEN" ]; then
-        git config user.email "ci@gitlab.com"
-        git config user.name "GitLab CI/CD"
-        git remote set-url origin "https://oauth2:${GIT_PUSH_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
-        git add "$BASELINE_FILE"
-        git commit -m "Auto-update: Deploy validated YARA rules [skip ci]" || true
-        git push origin HEAD:$CI_COMMIT_BRANCH || true
-      fi
-  
-  artifacts:
-    paths:
-      - $BASELINE_FILE
-    expire_in: 90 days
-  
-  # Only deploy on main branch after successful merge
   rules:
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-      when: manual
-  
-  needs:
-    - job: merge_valid_rules
-      artifacts: true
-
-# ==============================================================================
-# MANUAL JOBS
-# ==============================================================================
-
-# Manual job to check specific rule file
-validate_single_rule:
-  stage: validate
-  image: $PYTHON_IMAGE
-  <<: *python_setup
+    # Run if we're on staging AND there were changes in NEW_RULES_DIR
+    - if: '$CI_COMMIT_BRANCH == "staging"'
+      changes:
+        - "$NEW_RULES_DIR/**"
+      when: on_success
+  tags:
+    - yaralyzer
   script:
-    - |
-      if [ -z "$RULE_FILE" ]; then
-        echo "❌ Please set RULE_FILE variable"
-        exit 1
-      fi
-    - echo "🔍 Validating single rule: $RULE_FILE"
-    - |
-      python scripts/validate_yara_rules.py "$(dirname $RULE_FILE)" \
-        --verbose \
-        --json-report "single_rule_report.json"
-  
-  artifacts:
-    when: always
-    paths:
-      - single_rule_report.json
-    expire_in: 1 day
-  
-  rules:
-    - if: '$RULE_FILE'
-      when: manual
-
-# Clean up failed rules (for testing)
-cleanup_failed:
-  stage: validate
-  script:
-    - rm -rf "$FAILED_DIR"
-    - echo "✅ Cleaned up failed rules directory"
-  
-  rules:
-    - when: manual\
-
-# ==============================================================================
-# STAGE 2: REPORT
-# ==============================================================================
-
-generate_report:
-  stage: report
-  image: $PYTHON_IMAGE
-  dependencies:
-    - validate_yara_rules
-  script:
-    - echo "📊 Generating validation report"
+    - echo "🚀 Pushing validation results to repository"
     
-    # Print summary from JSON report
+    # Verify we have artifacts to push
     - |
-      python3 << EOF
-      import json
-      import sys
+      FILES_TO_PUSH=0
+      [ -f "$JSON_REPORT" ] && FILES_TO_PUSH=$((FILES_TO_PUSH + 1))
+      [ -f "$MD_REPORT" ] && FILES_TO_PUSH=$((FILES_TO_PUSH + 1))
+      [ -d "$VALIDATED_DIR" ] && [ -n "$(ls -A '$VALIDATED_DIR' 2>/dev/null)" ] && FILES_TO_PUSH=$((FILES_TO_PUSH + 1))
       
-      try:
-          with open('$JSON_REPORT', 'r') as f:
-              report = json.load(f)
-          
-          summary = report['summary']
-          print("\n" + "="*80)
-          print("VALIDATION SUMMARY")
-          print("="*80)
-          print(f"Total Rules:     {summary['total']}")
-          print(f"Valid Rules:     {summary['valid']}")
-          print(f"Broken Rules:    {summary['broken']}")
-          print(f"Repaired Rules:  {summary['repaired']}")
-          print(f"Success Rate:    {summary['success_rate']}%")
-          print("="*80 + "\n")
-          
-          # Exit with error if there are broken rules
-          if summary['broken'] > 0:
-              print(f"❌ {summary['broken']} rule(s) failed validation")
-              sys.exit(1)
-          else:
-              print("✅ All rules passed validation")
-              sys.exit(0)
-      except Exception as e:
-          print(f"Error reading report: {e}")
-          sys.exit(1)
-      EOF
-    
-    # Display markdown report
-    - |
-      if [ -f "$MD_REPORT" ]; then
-        echo "📝 Markdown Report:"
-        cat "$MD_REPORT"
+      if [ $FILES_TO_PUSH -eq 0 ]; then
+        echo "⚠️  No files to push (validation may have failed or produced no output)"
+        exit 0
       fi
+      
+      echo "✅ Found $FILES_TO_PUSH artifact(s) to push"
     
-    # List failed rules
-    - |
-      if [ -d "$FAILED_DIR" ] && [ "$(ls -A $FAILED_DIR)" ]; then
-        echo ""
-        echo "❌ FAILED RULES:"
-        ls -1 "$FAILED_DIR"
-      fi
+    # Configure Git
+    - git config --global user.email "${user_email}"
+    - git config --global user.name "${user_name}"
+    - git config --global http.sslcainfo "${SSL_CERT_FILE_PATH}"
+    - git remote set-url origin https://alesher:${PAT_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git
+    
+    # Stage files
+    - git add "$VALIDATED_DIR/" || true
+    - git add "$FAILED_DIR/" || true
+    - git add "$JSON_REPORT" || true
+    - git add "$MD_REPORT" || true
+    
+    # Show what we're committing
+    - echo "📝 Files to be committed:"
+    - git status --short
+    
+    # Commit and push (exit gracefully if nothing to commit)
+    - git commit -m "CI: Add validated YARA rules and reports [skip ci]" || (echo "Nothing to commit" && exit 0)
+    - git push origin HEAD:${CI_COMMIT_REF_NAME}
+    - echo "✅ Successfully pushed to ${CI_COMMIT_REF_NAME}"
   
-  artifacts:
-    when: always
-    reports:
-      # This creates a downloadable report in GitLab UI
-      dotenv: report.env
-    expire_in: 7 days
-  
-  # This job should fail if validation failed
-  allow_failure: false
+  allow_failure: true
