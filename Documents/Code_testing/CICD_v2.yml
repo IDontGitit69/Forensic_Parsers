@@ -21,14 +21,14 @@ variables:
   PYTHON_IMAGE: "python:3.11-slim"
  
 # Template for Python setup
-.python_setup: &python_setup
+.python_setup:
   before_script:
     - pip3 install --quiet --no-cache-dir yara-python
     - python3 --version
-    - "python3 -c \"import yara; print(f'YARA version: {yara.__version__}')\""
+    - python3 -c "import yara; print(f'YARA version: {yara.__version__}')"
 
 # Template for Git setup
-.git_setup: &git_setup
+.git_setup:
   before_script:
     - git config --global user.email "${user_email}"
     - git config --global user.name "${user_name}"
@@ -40,6 +40,7 @@ variables:
 # ==============================================================================
 validate_yara_rules:
   stage: validate
+  extends: .python_setup
   rules:
     - changes:
         - "$NEW_RULES_DIR/**"
@@ -48,7 +49,6 @@ validate_yara_rules:
   image: $PYTHON_IMAGE
   tags:
     - yaralyzer
-  <<: *python_setup
   script:
     - echo "🔍 Validating YARA rules in $NEW_RULES_DIR"
     - |
@@ -77,6 +77,7 @@ validate_yara_rules:
 # ==============================================================================
 push_validated_rules:
   stage: push
+  extends: .git_setup
   needs:
     - job: validate_yara_rules
       artifacts: true
@@ -87,7 +88,6 @@ push_validated_rules:
       when: on_success
   tags:
     - yaralyzer
-  <<: *git_setup
   script:
     - echo "🚀 Pushing validation results to repository"
     
@@ -150,6 +150,7 @@ Pipeline: $CI_PIPELINE_URL"
 # ==============================================================================
 cleanup_processed_rules:
   stage: cleanup
+  extends: .git_setup
   needs:
     - job: validate_yara_rules
       artifacts: true
@@ -161,7 +162,6 @@ cleanup_processed_rules:
       when: on_success
   tags:
     - yaralyzer
-  <<: *git_setup
   script:
     - echo "🧹 Cleaning up processed rules from $NEW_RULES_DIR"
     
