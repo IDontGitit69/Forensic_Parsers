@@ -1,63 +1,33 @@
+Engagement Support
 
-Subject: Request for Git Installation on Processing Servers & Service Account for GitLab Access
+I continued analyzing the artifacts collected from the customer environment. We are currently awaiting one additional system image from the customer—believed to be the host that originally contained the malware discovered on a separate device.
 
-Hi <Supervisor Name>,
+Based on the indicators of compromise (IOCs) identified on the analyzed machine, we assess with high confidence that the second host, for which we only have a logical collection, also contained the same malware.
 
-I’m reaching out with two related requests that support our YARA rule deployment workflow and future operational automation.
+Obtaining a full image of this second machine will provide an opportunity to validate how the malware was deployed and used across multiple systems. There is a strong possibility that the variant on the second host may have been modified to specifically communicate with the C2 node. A comparative analysis could help answer open questions about the malware’s functionality, operator behavior, and potential lateral movement or persistence mechanisms.
 
-Background & Justification
-We currently allow users to upload YARA rules into our detection rules repository, and those rules are validated through the CI pipeline I’m building. However, we do not yet have a reliable way to push validated rules into the production environment. The most practical method is for the processing server to perform a git pull of the validated rules and place them in the correct directory for operational use.
+Scripting & Tooling Work
 
-Because our GitLab instance requires multi-factor authentication, the processing server cannot authenticate directly without a dedicated service account. At the moment, my personal GitLab access token is being used on my laptop-based GitLab runner for validation and reporting tasks. As this functionality moves into a sustained environment (either the test server or the processing server), a service account will be required.
+Continued development on the script I’ve been building to streamline artifact processing.
 
-Additionally, having Git installed on the processing servers will streamline how we update operational scripts. Instead of manually deploying updates, we could maintain the scripts in GitLab and allow the processing server (using the same service account) to pull updates. This provides proper versioning, history tracking, and reduces overhead.
+This week, I focused on improving the script’s reliability and expanding its logic to better handle edge cases in the data.
 
-Requests
+Additional testing was conducted using real-world artifacts from current engagements to validate functionality.
 
-Install Git on the processing servers to enable rule deployment and version-controlled script updates.
+Planned Work for Next Week
 
-Guidance/support in creating a GitLab service account with API-only, read-only access to one or two specific repositories used for rule deployment and script management.
+Begin deeper analysis if/when the additional system image is received.
 
-These additions directly support our operational workflow and will allow us to deliver a more stable, automated, and auditable rule deployment process.
+Perform comparative malware analysis between the two hosts.
 
-Please let me know if you need more technical detail or if we should discuss this in a meeting.
+Confirm whether any configuration differences or variant modifications exist.
 
-Thank you,
-Tony Lesher
+Document findings related to C2 communication, execution flow, and operator intent.
 
-📊 Simple Visualization of the Workflow
-          +--------------------+
-          |  User submits YARA |
-          |      rules         |
-          +---------+----------+
-                    |
-                    v
-        +----------------------------+
-        | Rules enter detection repo |
-        +-------------+--------------+
-                      |
-                      v
-      +------------------------------------+
-      | Validation CI Pipeline             |
-      | - Metadata checks                  |
-      | - Duplicate detection              |
-      | - Output: validated rule folder    |
-      +-----------------+------------------+
-                        |
-                        v
-     +----------------------------------------+
-     | Processing Server (needs Git + service |
-     | account for GitLab read access)        |
-     +-----------------+----------------------+
-                        |
-                        v
-          +---------------------------------+
-          | Server performs `git pull` of   |
-          | latest validated rules           |
-          +-----------------+---------------+
-                        |
-                        v
-          +---------------------------------+
-          | THOR scan runs using the most   |
-          | recent validated rule set       |
-          +---------------------------------+
+Continue refining the script, including:
+
+Expanding automation coverage for recurring tasks.
+
+Adding more robust error handling and logging.
+
+Preparing documentation so the script can be used by other analysts.
