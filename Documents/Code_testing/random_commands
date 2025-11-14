@@ -1,1 +1,63 @@
 
+Subject: Request for Git Installation on Processing Servers & Service Account for GitLab Access
+
+Hi <Supervisor Name>,
+
+I’m reaching out with two related requests that support our YARA rule deployment workflow and future operational automation.
+
+Background & Justification
+We currently allow users to upload YARA rules into our detection rules repository, and those rules are validated through the CI pipeline I’m building. However, we do not yet have a reliable way to push validated rules into the production environment. The most practical method is for the processing server to perform a git pull of the validated rules and place them in the correct directory for operational use.
+
+Because our GitLab instance requires multi-factor authentication, the processing server cannot authenticate directly without a dedicated service account. At the moment, my personal GitLab access token is being used on my laptop-based GitLab runner for validation and reporting tasks. As this functionality moves into a sustained environment (either the test server or the processing server), a service account will be required.
+
+Additionally, having Git installed on the processing servers will streamline how we update operational scripts. Instead of manually deploying updates, we could maintain the scripts in GitLab and allow the processing server (using the same service account) to pull updates. This provides proper versioning, history tracking, and reduces overhead.
+
+Requests
+
+Install Git on the processing servers to enable rule deployment and version-controlled script updates.
+
+Guidance/support in creating a GitLab service account with API-only, read-only access to one or two specific repositories used for rule deployment and script management.
+
+These additions directly support our operational workflow and will allow us to deliver a more stable, automated, and auditable rule deployment process.
+
+Please let me know if you need more technical detail or if we should discuss this in a meeting.
+
+Thank you,
+Tony Lesher
+
+📊 Simple Visualization of the Workflow
+          +--------------------+
+          |  User submits YARA |
+          |      rules         |
+          +---------+----------+
+                    |
+                    v
+        +----------------------------+
+        | Rules enter detection repo |
+        +-------------+--------------+
+                      |
+                      v
+      +------------------------------------+
+      | Validation CI Pipeline             |
+      | - Metadata checks                  |
+      | - Duplicate detection              |
+      | - Output: validated rule folder    |
+      +-----------------+------------------+
+                        |
+                        v
+     +----------------------------------------+
+     | Processing Server (needs Git + service |
+     | account for GitLab read access)        |
+     +-----------------+----------------------+
+                        |
+                        v
+          +---------------------------------+
+          | Server performs `git pull` of   |
+          | latest validated rules           |
+          +-----------------+---------------+
+                        |
+                        v
+          +---------------------------------+
+          | THOR scan runs using the most   |
+          | recent validated rule set       |
+          +---------------------------------+
