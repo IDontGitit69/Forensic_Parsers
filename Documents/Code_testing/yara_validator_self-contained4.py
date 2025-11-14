@@ -769,12 +769,13 @@ class FileValidator:
                 if was_changed:
                     yara_file.content = deduplicated_content
                     yara_file.was_deduplicated = True
-                    yara_file.count_rules()
+                    yara_file.count_rules()  # Recount after deduplication
             
             # Check if file is empty after deduplication
             if yara_file.is_empty():
                 yara_file.status = YaraFile.STATUS_EMPTY
-                return True
+                print(f"  ⚠️  File became empty after deduplication: {yara_file.filename}")
+                return True  # Return True so it doesn't go into broken files
             
             # Validate metadata if required
             metadata_valid = self._validate_file_metadata(yara_file)
@@ -823,9 +824,7 @@ class FileValidator:
                 # Only include non-empty files in valid list
                 if not yara_file.is_empty():
                     valid.append(yara_file)
-                else:
-                    # Skip empty files - they won't be written
-                    print(f"  ⚠️  Skipping empty file after deduplication: {yara_file.filename}")
+                # Empty files are silently skipped (already printed warning in validate_file)
             else:
                 broken.append(yara_file)
         
@@ -981,8 +980,13 @@ def write_valid_files(yara_files, output_dir):
     skipped_empty = []
     
     for yara_file in yara_files:
-        # Skip empty files
-        if yara_file.is_empty():
+        # Skip empty files - check both status and rule_count
+        if yara_file.is_empty() or yara_file.status == YaraFile.STATUS_EMPTY:
+            skipped_empty.append(yara_file.filename)
+            continue
+        
+        # Double check that content actually has rules
+        if not yara_file.content or yara_file.content.strip() == "":
             skipped_empty.append(yara_file.filename)
             continue
         
