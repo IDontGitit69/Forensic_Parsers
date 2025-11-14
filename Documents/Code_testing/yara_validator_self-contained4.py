@@ -444,6 +444,7 @@ class YaraFile:
     STATUS_UNKNOWN = 'unknown'
     STATUS_VALID = 'valid'
     STATUS_BROKEN = 'broken'
+    STATUS_EMPTY = 'empty'
     
     def __init__(self, filepath, content=None):
         self.filepath = filepath
@@ -471,6 +472,10 @@ class YaraFile:
             rule_pattern = re.compile(r'(?i)^\s*(?:private\s+|global\s+)?rule\s+\w+', re.MULTILINE)
             self.rule_count = len(rule_pattern.findall(self.content))
         return self.rule_count
+    
+    def is_empty(self):
+        """Check if file has no rules after deduplication."""
+        return self.rule_count == 0
     
     def to_dict(self):
         """Convert to dictionary for JSON serialization."""
@@ -732,16 +737,21 @@ class FileValidator:
                 kept_rules.append(rule_source)
         
         if changed:
-            header = "// This file has been processed for deduplication\n"
-            header += f"// Original: {yara_file.filepath}\n"
-            header += f"// Processed: {datetime.now().isoformat()}\n\n"
-            
-            new_content = header
-            
-            if imports:
-                new_content += imports + "\n\n"
-            
-            new_content += "\n\n".join(kept_rules)
+            # Only add header and content if there are rules left
+            if kept_rules:
+                header = "// This file has been processed for deduplication\n"
+                header += f"// Original: {yara_file.filepath}\n"
+                header += f"// Processed: {datetime.now().isoformat()}\n\n"
+                
+                new_content = header
+                
+                if imports:
+                    new_content += imports + "\n\n"
+                
+                new_content += "\n\n".join(kept_rules)
+            else:
+                # File is now empty after deduplication
+                new_content = ""
             
             return new_content, True
         else:
@@ -760,6 +770,11 @@ class FileValidator:
                     yara_file.content = deduplicated_content
                     yara_file.was_deduplicated = True
                     yara_file.count_rules()
+            
+            # Check if file is empty after deduplication
+            if yara_file.is_empty():
+                yara_file.status = YaraFile.STATUS_EMPTY
+                return True
             
             # Validate metadata if required
             metadata_valid = self._validate_file_metadata(yara_file)
@@ -805,7 +820,12 @@ class FileValidator:
         
         for yara_file in self.files:
             if self.validate_file(yara_file):
-                valid.append(yara_file)
+                # Only include non-empty files in valid list
+                if not yara_file.is_empty():
+                    valid.append(yara_file)
+                else:
+                    # Skip empty files - they won't be written
+                    print(f"  ⚠️  Skipping empty file after deduplication: {yara_file.filename}")
             else:
                 broken.append(yara_file)
         
@@ -955,11 +975,17 @@ def collect_yara_files(directory, extensions=None):
 
 
 def write_valid_files(yara_files, output_dir):
-    """Write valid YARA files to output directory."""
+    """Write valid YARA files to output directory (skipping empty files)."""
     os.makedirs(output_dir, exist_ok=True)
     written_files = []
+    skipped_empty = []
     
     for yara_file in yara_files:
+        # Skip empty files
+        if yara_file.is_empty():
+            skipped_empty.append(yara_file.filename)
+            continue
+        
         output_path = os.path.join(output_dir, yara_file.filename)
         
         counter = 1
@@ -981,6 +1007,9 @@ def write_valid_files(yara_files, output_dir):
             written_files.append(output_path)
         except Exception as e:
             print(f"Error writing {output_path}: {e}", file=sys.stderr)
+    
+    if skipped_empty:
+        print(f"\n  ℹ️  Skipped {len(skipped_empty)} empty file(s): {', '.join(skipped_empty)}")
     
     return written_files
 
