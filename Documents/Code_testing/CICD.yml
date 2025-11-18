@@ -1,3 +1,34 @@
+# GitLab CI/CD Pipeline for YARA Rule Validation and Deployment
+
+stages:
+  - validate
+  - push
+
+variables:
+  # Directories
+  NEW_RULES_DIR: "Yara Rules/New Rules"
+  VALIDATED_DIR: "Yara Rules/validated"
+  FAILED_DIR: "Yara Rules/failed"
+  BASELINE_FILE: "Yara Rules/Master_Rules_List.yar"
+  GIT_DEPTH: 0
+  
+  # Report files
+  JSON_REPORT: "Yara Rules/validation_report.json"
+  MD_REPORT: "Yara Rules/validation_report.md"
+ 
+  # Python image
+  PYTHON_IMAGE: "python:3.11-slim"
+ 
+# Template for Python setup
+.python_setup: &python_setup
+  before_script:
+    - pip3 install --quiet --no-cache-dir yara-python
+    - python3 --version
+    - "python3 -c \"import yara; print(f'YARA version: {yara.__version__}')\""
+ 
+# ==============================================================================
+# STAGE 1: VALIDATE
+# ==============================================================================
 validate_yara_rules:
   stage: validate
   rules:
@@ -6,9 +37,18 @@ validate_yara_rules:
       when: on_success
     - when: never
   image: $PYTHON_IMAGE
+  #tags:
+    #- yaralyzer
   <<: *python_setup
   script:
     - echo "🔍 Validating YARA rules in $NEW_RULES_DIR"
+    
+    # IMPORTANT: Clear failed directory before validation to prevent duplicates
+    - echo "🧹 Clearing previous failed rules"
+    - rm -rf "$FAILED_DIR"
+    - mkdir -p "$FAILED_DIR"
+    
+    # Run validation
     - |
       python3 "Yara Rules/Tools/Yaralyzer.py" "$NEW_RULES_DIR" \
         --output-valid-dir "$VALIDATED_DIR" \
@@ -19,32 +59,86 @@ validate_yara_rules:
         --verbose \
         --require-metadata
     
-    # NEW: Clean up processed files from NEW_RULES_DIR
+    # Store validation exit code
+    - VALIDATION_EXIT_CODE=$?
+    - echo "Validation exit code: $VALIDATION_EXIT_CODE"
+    
+    # Clean up processed files from NEW_RULES_DIR (runs regardless of validation result)
     - echo "🧹 Cleaning up processed files from $NEW_RULES_DIR"
     - |
+      # Count files before cleanup
+      FILES_BEFORE=$(find "$NEW_RULES_DIR" -type f \( -name "*.yar" -o -name "*.yara" -o -name "*.rule" \) | wc -l)
+      echo "📊 Files in $NEW_RULES_DIR before cleanup: $FILES_BEFORE"
+      
+      # Create a list of all processed files (both validated and failed)
+      PROCESSED_FILES=""
+      
+      # Get validated files
       if [ -d "$VALIDATED_DIR" ] && [ -n "$(ls -A "$VALIDATED_DIR" 2>/dev/null)" ]; then
-        echo "✅ Removing validated files from $NEW_RULES_DIR"
-        for file in "$VALIDATED_DIR"/*.{yar,yara,rule}; do
+        echo "✅ Found validated files:"
+        for file in "$VALIDATED_DIR"/*; do
           [ -f "$file" ] || continue
+          # Extract original filename (strip any _1, _2 suffixes and header comments)
           basename_file=$(basename "$file")
-          # Remove the original file from NEW_RULES_DIR if it exists
-          [ -f "$NEW_RULES_DIR/$basename_file" ] && rm -f "$NEW_RULES_DIR/$basename_file"
+          # Try to find the original source file name from the header
+          original_name=$(grep "^// Source:" "$file" 2>/dev/null | sed 's/.*\///' || echo "$basename_file")
+          if [ -z "$original_name" ]; then
+            original_name="$basename_file"
+          fi
+          echo "  - $original_name"
+          PROCESSED_FILES="$PROCESSED_FILES $original_name"
         done
       fi
       
+      # Get failed files
       if [ -d "$FAILED_DIR" ] && [ -n "$(ls -A "$FAILED_DIR" 2>/dev/null)" ]; then
-        echo "❌ Removing failed files from $NEW_RULES_DIR"
-        for file in "$FAILED_DIR"/*.{yar,yara,rule}; do
+        echo "❌ Found failed files:"
+        for file in "$FAILED_DIR"/*; do
           [ -f "$file" ] || continue
+          # Extract original filename
           basename_file=$(basename "$file")
-          # Remove the original file from NEW_RULES_DIR if it exists
-          [ -f "$NEW_RULES_DIR/$basename_file" ] && rm -f "$NEW_RULES_DIR/$basename_file"
+          original_name=$(grep "^// Source:" "$file" 2>/dev/null | sed 's/.*\///' || echo "$basename_file")
+          if [ -z "$original_name" ]; then
+            original_name="$basename_file"
+          fi
+          echo "  - $original_name"
+          PROCESSED_FILES="$PROCESSED_FILES $original_name"
         done
       fi
+      
+      # Remove duplicates from PROCESSED_FILES list
+      PROCESSED_FILES=$(echo "$PROCESSED_FILES" | tr ' ' '\n' | sort -u | tr '\n' ' ')
+      
+      # Delete all processed files from NEW_RULES_DIR
+      if [ -n "$PROCESSED_FILES" ]; then
+        echo "🗑️  Removing processed files from $NEW_RULES_DIR:"
+        for filename in $PROCESSED_FILES; do
+          filepath="$NEW_RULES_DIR/$filename"
+          if [ -f "$filepath" ]; then
+            echo "  - Removing: $filename"
+            rm -f "$filepath"
+          fi
+        done
+      else
+        echo "⚠️  No processed files identified for cleanup"
+      fi
+      
+      # Alternatively, just remove ALL .yar/.yara/.rule files from NEW_RULES_DIR
+      # since they've all been processed (either validated or failed)
+      echo "🗑️  Removing all YARA files from $NEW_RULES_DIR:"
+      find "$NEW_RULES_DIR" -type f \( -name "*.yar" -o -name "*.yara" -o -name "*.rule" \) -delete
+      
+      # Count files after cleanup
+      FILES_AFTER=$(find "$NEW_RULES_DIR" -type f \( -name "*.yar" -o -name "*.yara" -o -name "*.rule" \) | wc -l)
+      echo "📊 Files in $NEW_RULES_DIR after cleanup: $FILES_AFTER"
+      echo "📊 Files removed: $((FILES_BEFORE - FILES_AFTER))"
     
     - echo "📊 Remaining files in $NEW_RULES_DIR:"
     - ls -la "$NEW_RULES_DIR" || echo "Directory empty or not found"
-
+    
+    # Exit with validation result
+    - exit $VALIDATION_EXIT_CODE
+ 
   artifacts:
     when: always
     paths:
@@ -53,5 +147,67 @@ validate_yara_rules:
       - $JSON_REPORT
       - $MD_REPORT
     expire_in: 7 days
-
+ 
+  allow_failure: true
+ 
+# ==============================================================================
+# STAGE 2: PUSH
+# ==============================================================================
+push_to_repo:
+  stage: push
+  needs:
+    - job: validate_yara_rules
+      artifacts: true
+  rules:
+    # Run if we're on staging AND there were changes in NEW_RULES_DIR
+    - if: '$CI_COMMIT_BRANCH == "staging"'
+      changes:
+        - "$NEW_RULES_DIR/**"
+      when: on_success
+  #tags:
+  #  - yaralyzer
+  script:
+    - echo "📤 Pushing validation results to repository"
+    
+    # Verify we have artifacts to push
+    - |
+      FILES_TO_PUSH=0
+      [ -f "$JSON_REPORT" ] && FILES_TO_PUSH=$((FILES_TO_PUSH + 1))
+      [ -f "$MD_REPORT" ] && FILES_TO_PUSH=$((FILES_TO_PUSH + 1))
+      [ -d "$VALIDATED_DIR" ] && [ -n "$(ls -A "$VALIDATED_DIR" 2>/dev/null)" ] && FILES_TO_PUSH=$((FILES_TO_PUSH + 1))
+      
+      if [ $FILES_TO_PUSH -eq 0 ]; then
+        echo "⚠️  No files to push (validation may have failed or produced no output)"
+        exit 0
+      fi
+      
+      echo "✅ Found $FILES_TO_PUSH artifact(s) to push"
+    
+    # Configure Git
+    - git config --global user.email "${user_email}"
+    - git config --global user.name "${user_name}"
+    - git config --global http.sslcainfo "${SSL_CERT_FILE_PATH}"
+    - git remote set-url origin https://alesher:${PAT_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git
+    
+    # Pull latest changes to avoid conflicts
+    - git pull origin $CI_COMMIT_REF_NAME --rebase || true
+    
+    # Stage files
+    - git add "$VALIDATED_DIR/" || true
+    - git add "$FAILED_DIR/" || true
+    - git add "$JSON_REPORT" || true
+    - git add "$MD_REPORT" || true
+    
+    # Also stage the now-empty NEW_RULES_DIR to commit the deletions
+    - git add "$NEW_RULES_DIR/" || true
+    
+    # Show what we're committing
+    - echo "📝 Files to be committed:"
+    - git status --short
+    
+    # Commit and push (exit gracefully if nothing to commit)
+    - git commit -m "CI: Add validated YARA rules and reports [skip ci]" || (echo "Nothing to commit" && exit 0)
+    - git push origin HEAD:${CI_COMMIT_REF_NAME}
+    - echo "✅ Successfully pushed to ${CI_COMMIT_REF_NAME}"
+  
   allow_failure: true
