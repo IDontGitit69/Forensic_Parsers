@@ -1,34 +1,3 @@
-# GitLab CI/CD Pipeline for YARA Rule Validation and Deployment
- 
-stages:
-  - validate
-  - push
-
-variables:
-  # Directories
-  NEW_RULES_DIR: "Yara Rules/New Rules"
-  VALIDATED_DIR: "Yara Rules/validated"
-  FAILED_DIR: "Yara Rules/failed"
-  BASELINE_FILE: "Yara Rules/Master_Rules_List.yar"
-  GIT_DEPTH: 0
-  
-  # Report files
-  JSON_REPORT: "Yara Rules/validation_report.json"
-  MD_REPORT: "Yara Rules/validation_report.md"
- 
-  # Python image
-  PYTHON_IMAGE: "python:3.11-slim"
- 
-# Template for Python setup
-.python_setup: &python_setup
-  before_script:
-    - pip3 install --quiet --no-cache-dir yara-python
-    - python3 --version
-    - "python3 -c \"import yara; print(f'YARA version: {yara.__version__}')\""
- 
-# ==============================================================================
-# STAGE 1: VALIDATE
-# ==============================================================================
 validate_yara_rules:
   stage: validate
   rules:
@@ -37,8 +6,6 @@ validate_yara_rules:
       when: on_success
     - when: never
   image: $PYTHON_IMAGE
-  tags:
-    - yaralyzer
   <<: *python_setup
   script:
     - echo "🔍 Validating YARA rules in $NEW_RULES_DIR"
@@ -51,7 +18,33 @@ validate_yara_rules:
         --deduplicate \
         --verbose \
         --require-metadata
- 
+    
+    # NEW: Clean up processed files from NEW_RULES_DIR
+    - echo "🧹 Cleaning up processed files from $NEW_RULES_DIR"
+    - |
+      if [ -d "$VALIDATED_DIR" ] && [ -n "$(ls -A "$VALIDATED_DIR" 2>/dev/null)" ]; then
+        echo "✅ Removing validated files from $NEW_RULES_DIR"
+        for file in "$VALIDATED_DIR"/*.{yar,yara,rule}; do
+          [ -f "$file" ] || continue
+          basename_file=$(basename "$file")
+          # Remove the original file from NEW_RULES_DIR if it exists
+          [ -f "$NEW_RULES_DIR/$basename_file" ] && rm -f "$NEW_RULES_DIR/$basename_file"
+        done
+      fi
+      
+      if [ -d "$FAILED_DIR" ] && [ -n "$(ls -A "$FAILED_DIR" 2>/dev/null)" ]; then
+        echo "❌ Removing failed files from $NEW_RULES_DIR"
+        for file in "$FAILED_DIR"/*.{yar,yara,rule}; do
+          [ -f "$file" ] || continue
+          basename_file=$(basename "$file")
+          # Remove the original file from NEW_RULES_DIR if it exists
+          [ -f "$NEW_RULES_DIR/$basename_file" ] && rm -f "$NEW_RULES_DIR/$basename_file"
+        done
+      fi
+    
+    - echo "📊 Remaining files in $NEW_RULES_DIR:"
+    - ls -la "$NEW_RULES_DIR" || echo "Directory empty or not found"
+
   artifacts:
     when: always
     paths:
@@ -60,61 +53,5 @@ validate_yara_rules:
       - $JSON_REPORT
       - $MD_REPORT
     expire_in: 7 days
- 
-  allow_failure: true
- 
-# ==============================================================================
-# STAGE 2: PUSH
-# ==============================================================================
-push_to_repo:
-  stage: push
-  needs:
-    - job: validate_yara_rules
-      artifacts: true
-  rules:
-    # Run if we're on staging AND there were changes in NEW_RULES_DIR
-    - if: '$CI_COMMIT_BRANCH == "staging"'
-      changes:
-        - "$NEW_RULES_DIR/**"
-      when: on_success
-  tags:
-    - yaralyzer
-  script:
-    - echo "🚀 Pushing validation results to repository"
-    
-    # Verify we have artifacts to push
-    - |
-      FILES_TO_PUSH=0
-      [ -f "$JSON_REPORT" ] && FILES_TO_PUSH=$((FILES_TO_PUSH + 1))
-      [ -f "$MD_REPORT" ] && FILES_TO_PUSH=$((FILES_TO_PUSH + 1))
-      [ -d "$VALIDATED_DIR" ] && [ -n "$(ls -A '$VALIDATED_DIR' 2>/dev/null)" ] && FILES_TO_PUSH=$((FILES_TO_PUSH + 1))
-      
-      if [ $FILES_TO_PUSH -eq 0 ]; then
-        echo "⚠️  No files to push (validation may have failed or produced no output)"
-        exit 0
-      fi
-      
-      echo "✅ Found $FILES_TO_PUSH artifact(s) to push"
-    
-    # Configure Git
-    - git config --global user.email "${user_email}"
-    - git config --global user.name "${user_name}"
-    - git config --global http.sslcainfo "${SSL_CERT_FILE_PATH}"
-    - git remote set-url origin https://alesher:${PAT_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git
-    
-    # Stage files
-    - git add "$VALIDATED_DIR/" || true
-    - git add "$FAILED_DIR/" || true
-    - git add "$JSON_REPORT" || true
-    - git add "$MD_REPORT" || true
-    
-    # Show what we're committing
-    - echo "📝 Files to be committed:"
-    - git status --short
-    
-    # Commit and push (exit gracefully if nothing to commit)
-    - git commit -m "CI: Add validated YARA rules and reports [skip ci]" || (echo "Nothing to commit" && exit 0)
-    - git push origin HEAD:${CI_COMMIT_REF_NAME}
-    - echo "✅ Successfully pushed to ${CI_COMMIT_REF_NAME}"
-  
+
   allow_failure: true
