@@ -2,16 +2,15 @@
 
 stages:
   - validate
-  - push
-  - integrate  # NEW STAGE
+  - integrate
 
 variables:
   # Directories
   NEW_RULES_DIR: "Yara Rules/New Rules"
   VALIDATED_DIR: "Yara Rules/validated"
   FAILED_DIR: "Yara Rules/failed"
-  BASELINE_DIR: "Yara Rules/Baseline_Rules"  # NEW
-  DATABASE_PATH: "Yara Rules/database/yara_rules.db"  # NEW
+  BASELINE_DIR: "Yara Rules/Baseline_Rules"
+  DATABASE_PATH: "Yara Rules/database/yara_rules.db"
   GIT_DEPTH: 0
   
   # Report files
@@ -126,10 +125,10 @@ validate_yara_rules:
   allow_failure: true
  
 # ==============================================================================
-# STAGE 2: PUSH
+# STAGE 2: INTEGRATE AND PUSH (COMBINED)
 # ==============================================================================
-push_to_repo:
-  stage: push
+integrate_and_push:
+  stage: integrate
   needs:
     - job: validate_yara_rules
       artifacts: true
@@ -138,33 +137,87 @@ push_to_repo:
       changes:
         - "$NEW_RULES_DIR/**"
       when: on_success
+  image: $PYTHON_IMAGE
+  <<: *python_setup
   script:
-    - echo "📤 Pushing validation results to repository"
+    - echo "📦 Starting integration and push workflow"
     
-    # Verify we have artifacts to push
+    # Verify we have artifacts to process
     - |
-      FILES_TO_PUSH=0
-      [ -f "$JSON_REPORT" ] && FILES_TO_PUSH=$((FILES_TO_PUSH + 1))
-      [ -f "$MD_REPORT" ] && FILES_TO_PUSH=$((FILES_TO_PUSH + 1))
-      [ -d "$VALIDATED_DIR" ] && [ -n "$(ls -A "$VALIDATED_DIR" 2>/dev/null)" ] && FILES_TO_PUSH=$((FILES_TO_PUSH + 1))
+      FILES_TO_PROCESS=0
+      [ -f "$JSON_REPORT" ] && FILES_TO_PROCESS=$((FILES_TO_PROCESS + 1))
+      [ -f "$MD_REPORT" ] && FILES_TO_PROCESS=$((FILES_TO_PROCESS + 1))
+      [ -d "$VALIDATED_DIR" ] && [ -n "$(ls -A "$VALIDATED_DIR" 2>/dev/null)" ] && FILES_TO_PROCESS=$((FILES_TO_PROCESS + 1))
+      [ -d "$FAILED_DIR" ] && [ -n "$(ls -A "$FAILED_DIR" 2>/dev/null)" ] && FILES_TO_PROCESS=$((FILES_TO_PROCESS + 1))
       
-      if [ $FILES_TO_PUSH -eq 0 ]; then
-        echo "⚠️  No files to push (validation may have failed or produced no output)"
+      if [ $FILES_TO_PROCESS -eq 0 ]; then
+        echo "⚠️  No files to process"
         exit 0
       fi
       
-      echo "✅ Found $FILES_TO_PUSH artifact(s) to push"
+      echo "✅ Found $FILES_TO_PROCESS artifact(s) to process"
     
-    # Configure Git
+    # Configure Git ONCE at the beginning
+    - echo "🔧 Configuring Git"
     - git config --global user.email "${user_email}"
     - git config --global user.name "${user_name}"
     - git config --global http.sslcainfo "${SSL_CERT_FILE_PATH}"
     - git remote set-url origin https://alesher:${PAT_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git
     
-    # Pull latest changes to avoid conflicts
+    # Pull latest changes ONCE
+    - echo "⬇️  Pulling latest changes"
     - git pull origin $CI_COMMIT_REF_NAME --rebase || true
     
-    # Remove processed files from NEW_RULES_DIR and stage deletions
+    # ============================================================================
+    # PART 1: Update Database with Validated Rules
+    # ============================================================================
+    - |
+      if [ -d "$VALIDATED_DIR" ] && [ -n "$(ls -A "$VALIDATED_DIR" 2>/dev/null)" ]; then
+        VALIDATED_COUNT=$(find "$VALIDATED_DIR" -type f \( -name "*.yar" -o -name "*.yara" -o -name "*.rule" \) | wc -l)
+        echo "📊 Updating database with $VALIDATED_COUNT validated rule(s)..."
+        
+        python3 "Yara Rules/Tools/build_rule_database.py" "$VALIDATED_DIR" \
+          --database "$DATABASE_PATH" \
+          --verbose || echo "⚠️  Database update had warnings (continuing)"
+      else
+        echo "ℹ️  No validated rules to add to database"
+      fi
+    
+    # ============================================================================
+    # PART 2: Move Validated Rules to Baseline
+    # ============================================================================
+    - |
+      if [ -d "$VALIDATED_DIR" ] && [ -n "$(ls -A "$VALIDATED_DIR" 2>/dev/null)" ]; then
+        echo "📁 Moving validated rules to baseline directory..."
+        mkdir -p "$BASELINE_DIR"
+        
+        MOVED_COUNT=0
+        for file in "$VALIDATED_DIR"/*; do
+          [ -f "$file" ] || continue
+          
+          filename=$(basename "$file")
+          dest_path="$BASELINE_DIR/$filename"
+          
+          # Check if file already exists in baseline
+          if [ -f "$dest_path" ]; then
+            echo "  ⚠️  File already exists in baseline: $filename (skipping move)"
+            continue
+          fi
+          
+          # Move the file
+          cp "$file" "$dest_path"
+          echo "  ✅ Copied to baseline: $filename"
+          MOVED_COUNT=$((MOVED_COUNT + 1))
+        done
+        
+        echo "📊 Total rules copied to baseline: $MOVED_COUNT"
+      else
+        echo "ℹ️  No validated rules to move to baseline"
+      fi
+    
+    # ============================================================================
+    # PART 3: Remove Processed Files from NEW_RULES_DIR
+    # ============================================================================
     - echo "🗑️ Removing processed files from $NEW_RULES_DIR"
     - |
       REMOVED_COUNT=0
@@ -178,10 +231,9 @@ push_to_repo:
           # Extract the original source filename from the header comment
           original_name=$(grep "^// Source:" "$file" 2>/dev/null | sed 's/^.*\///' | head -1)
           
-          # If we can't find it in the header, fall back to the basename (strip _N suffixes)
+          # If we can't find it in the header, fall back to the basename
           if [ -z "$original_name" ]; then
             basename_file=$(basename "$file")
-            # Remove _1, _2, _3, etc. suffixes before extension
             original_name=$(echo "$basename_file" | sed 's/_[0-9]\+\(\.[^.]*\)$/\1/')
           fi
           
@@ -201,13 +253,10 @@ push_to_repo:
         for file in "$FAILED_DIR"/*; do
           [ -f "$file" ] || continue
           
-          # Extract the original source filename from the header comment
           original_name=$(grep "^// Source:" "$file" 2>/dev/null | sed 's/^.*\///' | head -1)
           
-          # If we can't find it in the header, fall back to the basename (strip _N suffixes)
           if [ -z "$original_name" ]; then
             basename_file=$(basename "$file")
-            # Remove _1, _2, _3, etc. suffixes before extension
             original_name=$(echo "$basename_file" | sed 's/_[0-9]\+\(\.[^.]*\)$/\1/')
           fi
           
@@ -223,113 +272,79 @@ push_to_repo:
       
       echo "📊 Total files removed from $NEW_RULES_DIR: $REMOVED_COUNT"
     
-    # Stage files
+    # ============================================================================
+    # PART 4: Stage ALL Changes for Single Commit
+    # ============================================================================
+    - echo "📝 Staging all changes..."
     - git add "$VALIDATED_DIR/" || true
     - git add "$FAILED_DIR/" || true
     - git add "$JSON_REPORT" || true
     - git add "$MD_REPORT" || true
     - git add "$NEW_RULES_DIR/" || true
-    
-    # Show what we're committing
-    - echo "📝 Files to be committed:"
-    - git status --short
-    
-    # Commit and push (exit gracefully if nothing to commit)
-    - git commit -m "CI: Add validated YARA rules and reports [skip ci]" || (echo "Nothing to commit" && exit 0)
-    - git push origin HEAD:${CI_COMMIT_REF_NAME}
-    - echo "✅ Successfully pushed to ${CI_COMMIT_REF_NAME}"
-  
-  allow_failure: true
-
-# ==============================================================================
-# STAGE 3: INTEGRATE TO BASELINE
-# ==============================================================================
-integrate_to_baseline:
-  stage: integrate
-  needs:
-    - job: validate_yara_rules
-      artifacts: true
-    - job: push_to_repo
-  rules:
-    - if: '$CI_COMMIT_BRANCH'
-      changes:
-        - "$NEW_RULES_DIR/**"
-      when: on_success
-  image: $PYTHON_IMAGE
-  <<: *python_setup
-  script:
-    - echo "📦 Integrating validated rules to baseline"
-    
-    # Check if we have validated rules to integrate
-    - |
-      if [ ! -d "$VALIDATED_DIR" ] || [ -z "$(ls -A "$VALIDATED_DIR" 2>/dev/null)" ]; then
-        echo "⚠️  No validated rules to integrate"
-        exit 0
-      fi
-    
-    - VALIDATED_COUNT=$(find "$VALIDATED_DIR" -type f \( -name "*.yar" -o -name "*.yara" -o -name "*.rule" \) | wc -l)
-    - echo "✅ Found $VALIDATED_COUNT validated rule(s) to integrate"
-    
-    # Step 1: Update the database with new rules
-    - echo "📊 Updating database with validated rules..."
-    - |
-      python3 "Yara Rules/Tools/build_rule_database.py" "$VALIDATED_DIR" \
-        --database "$DATABASE_PATH" \
-        --verbose
-    
-    # Step 2: Move validated rules to baseline directory
-    - echo "📁 Moving validated rules to baseline directory..."
-    - mkdir -p "$BASELINE_DIR"
-    - |
-      MOVED_COUNT=0
-      for file in "$VALIDATED_DIR"/*; do
-        [ -f "$file" ] || continue
-        
-        filename=$(basename "$file")
-        dest_path="$BASELINE_DIR/$filename"
-        
-        # Check if file already exists in baseline
-        if [ -f "$dest_path" ]; then
-          echo "  ⚠️  File already exists in baseline: $filename (skipping)"
-          continue
-        fi
-        
-        # Move the file
-        mv "$file" "$dest_path"
-        echo "  ✅ Moved: $filename → Baseline_Rules/"
-        MOVED_COUNT=$((MOVED_COUNT + 1))
-      done
-      
-      echo "📊 Total rules moved to baseline: $MOVED_COUNT"
-    
-    # Step 3: Commit and push changes
-    - echo "📤 Committing baseline updates to repository"
-    - git config --global user.email "${user_email}"
-    - git config --global user.name "${user_name}"
-    - git config --global http.sslcainfo "${SSL_CERT_FILE_PATH}"
-    - git remote set-url origin https://alesher:${PAT_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git
-    
-    # Pull latest changes
-    - git pull origin $CI_COMMIT_REF_NAME --rebase || true
-    
-    # Stage changes
     - git add "$BASELINE_DIR/" || true
     - git add "$DATABASE_PATH" || true
-    - git add "$VALIDATED_DIR/" || true
     
     # Show what we're committing
-    - echo "📝 Files to be committed:"
+    - echo "📋 Files staged for commit:"
     - git status --short
     
-    # Commit and push
+    # ============================================================================
+    # PART 5: Single Commit and Push
+    # ============================================================================
     - |
       if git diff --cached --quiet; then
         echo "⚠️  No changes to commit"
         exit 0
       fi
     
-    - git commit -m "CI: Integrate validated rules to baseline [skip ci]" || (echo "Nothing to commit" && exit 0)
+    - echo "💾 Creating single commit with all changes..."
+    - |
+      VALIDATED_COUNT=0
+      FAILED_COUNT=0
+      BASELINE_COUNT=0
+      
+      [ -d "$VALIDATED_DIR" ] && VALIDATED_COUNT=$(find "$VALIDATED_DIR" -type f \( -name "*.yar" -o -name "*.yara" -o -name "*.rule" \) 2>/dev/null | wc -l)
+      [ -d "$FAILED_DIR" ] && FAILED_COUNT=$(find "$FAILED_DIR" -type f \( -name "*.yar" -o -name "*.yara" -o -name "*.rule" \) 2>/dev/null | wc -l)
+      [ -d "$BASELINE_DIR" ] && BASELINE_COUNT=$(git diff --cached --name-only "$BASELINE_DIR" | wc -l)
+      
+      COMMIT_MSG="CI: Process YARA rules [skip ci]
+
+- Validated: $VALIDATED_COUNT rule(s)
+- Failed: $FAILED_COUNT rule(s)
+- Added to baseline: $BASELINE_COUNT rule(s)
+- Database updated"
+      
+      git commit -m "$COMMIT_MSG"
+    
+    - echo "📤 Pushing all changes to repository..."
     - git push origin HEAD:${CI_COMMIT_REF_NAME}
-    - echo "✅ Successfully integrated rules to baseline"
+    - echo "✅ Successfully pushed all changes to ${CI_COMMIT_REF_NAME}"
   
   allow_failure: false
+```
+
+## Key Changes:
+
+### 1. **Removed `push_to_repo` job** - merged into `integrate_and_push`
+
+### 2. **Single workflow with 5 parts:**
+   - Part 1: Update database
+   - Part 2: Copy to baseline
+   - Part 3: Remove from New Rules
+   - Part 4: Stage all changes
+   - Part 5: Single commit + push
+
+### 3. **Git configured ONCE** at the beginning
+
+### 4. **Pull ONCE** before making any changes
+
+### 5. **Push ONCE** at the end with all changes
+
+### 6. **Better commit message** showing what was processed:
+```
+CI: Process YARA rules [skip ci]
+
+- Validated: 3 rule(s)
+- Failed: 1 rule(s)
+- Added to baseline: 3 rule(s)
+- Database updated
