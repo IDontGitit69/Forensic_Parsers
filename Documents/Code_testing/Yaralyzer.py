@@ -18,20 +18,20 @@ FEATURES:
 
 Usage:
     # Validate with metadata enforcement
-    python validate_yara_rules.py <directory> --require-metadata --output-valid-dir validated/
+    python Yaralyzer.py <directory> --require-metadata --output-valid-dir validated/
     
     # Auto-deduplicate and validate metadata
-    python validate_yara_rules.py <directory> --deduplicate --require-metadata --output-valid-dir clean/
+    python Yaralyzer.py <directory> --deduplicate --require-metadata --output-valid-dir clean/
 
 Examples:
     # Standard validation
-    python validate_yara_rules.py ./rules --output-valid-dir validated/
+    python Yaralyzer.py ./rules --output-valid-dir validated/
     
     # With metadata requirements
-    python validate_yara_rules.py ./rules --require-metadata --output-valid-dir validated/
+    python Yaralyzer.py ./rules --require-metadata --output-valid-dir validated/
     
     # Full cleanup: deduplicate + metadata validation
-    python validate_yara_rules.py ./rules --deduplicate --require-metadata --output-valid-dir clean/
+    python Yaralyzer.py ./rules --deduplicate --require-metadata --output-valid-dir clean/
 """
 
 import argparse
@@ -799,7 +799,7 @@ class FileValidator:
         
         # NEW: Check against baseline database first
         if self.baseline_checker and self.baseline_checker.enabled:
-            from validate_yara_rules import RuleFingerprint  # Use existing class
+            from Yaralyzer import RuleFingerprint  # Use existing class
             fingerprint = RuleFingerprint(rule_source)
             rule_hash = fingerprint.hash
             
