@@ -307,12 +307,12 @@ integrate_and_push:
       [ -d "$FAILED_DIR" ] && FAILED_COUNT=$(find "$FAILED_DIR" -type f \( -name "*.yar" -o -name "*.yara" -o -name "*.rule" \) 2>/dev/null | wc -l)
       [ -d "$BASELINE_DIR" ] && BASELINE_COUNT=$(git diff --cached --name-only "$BASELINE_DIR" | wc -l)
       
-      COMMIT_MSG="CI: Process YARA rules [skip ci]
-
-- Validated: $VALIDATED_COUNT rule(s)
-- Failed: $FAILED_COUNT rule(s)
-- Added to baseline: $BASELINE_COUNT rule(s)
-- Database updated"
+      git commit -m "CI: Process YARA rules [skip ci]
+      
+      - Validated: ${VALIDATED_COUNT} rule(s)
+      - Failed: ${FAILED_COUNT} rule(s)
+      - Added to baseline: ${BASELINE_COUNT} rule(s)
+      - Database updated"
       
       git commit -m "$COMMIT_MSG"
     
