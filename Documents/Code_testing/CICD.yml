@@ -3,13 +3,15 @@
 stages:
   - validate
   - push
+  - integrate  # NEW STAGE
 
 variables:
   # Directories
   NEW_RULES_DIR: "Yara Rules/New Rules"
   VALIDATED_DIR: "Yara Rules/validated"
   FAILED_DIR: "Yara Rules/failed"
-  BASELINE_FILE: "Yara Rules/Master_Rules_List.yar"
+  BASELINE_DIR: "Yara Rules/Baseline_Rules"  # NEW
+  DATABASE_PATH: "Yara Rules/database/yara_rules.db"  # NEW
   GIT_DEPTH: 0
   
   # Report files
@@ -24,7 +26,7 @@ variables:
   before_script:
     - pip3 install --quiet --no-cache-dir yara-python
     - python3 --version
-    - "python3 -c \"import yara; print(f'YARA version: {yara.__version__}')\""
+    - python3 -c "import yara; print(f'YARA version: {yara.__version__}')"
  
 # ==============================================================================
 # STAGE 1: VALIDATE
@@ -37,18 +39,12 @@ validate_yara_rules:
       when: on_success
     - when: never
   image: $PYTHON_IMAGE
-  #tags:
-    #- yaralyzer
   <<: *python_setup
   script:
     - echo "🔍 Validating YARA rules in $NEW_RULES_DIR"
-    
-    # IMPORTANT: Clear failed directory before validation to prevent duplicates
     - echo "🧹 Clearing previous failed rules"
     - rm -rf "$FAILED_DIR"
     - mkdir -p "$FAILED_DIR"
-    
-    # Run validation
     - |
       python3 "Yara Rules/Tools/Yaralyzer.py" "$NEW_RULES_DIR" \
         --output-valid-dir "$VALIDATED_DIR" \
@@ -57,30 +53,21 @@ validate_yara_rules:
         --markdown-report "$MD_REPORT" \
         --deduplicate \
         --verbose \
-        --require-metadata
-    
-    # Store validation exit code
+        --require-metadata \
+        --baseline-db "$DATABASE_PATH"
     - VALIDATION_EXIT_CODE=$?
-    - echo "Validation exit code: $VALIDATION_EXIT_CODE"
-    
-    # Clean up processed files from NEW_RULES_DIR (runs regardless of validation result)
+    - echo "Validation exit code=$VALIDATION_EXIT_CODE"
     - echo "🧹 Cleaning up processed files from $NEW_RULES_DIR"
     - |
-      # Count files before cleanup
       FILES_BEFORE=$(find "$NEW_RULES_DIR" -type f \( -name "*.yar" -o -name "*.yara" -o -name "*.rule" \) | wc -l)
       echo "📊 Files in $NEW_RULES_DIR before cleanup: $FILES_BEFORE"
-      
-      # Create a list of all processed files (both validated and failed)
+    - |
       PROCESSED_FILES=""
-      
-      # Get validated files
       if [ -d "$VALIDATED_DIR" ] && [ -n "$(ls -A "$VALIDATED_DIR" 2>/dev/null)" ]; then
         echo "✅ Found validated files:"
         for file in "$VALIDATED_DIR"/*; do
           [ -f "$file" ] || continue
-          # Extract original filename (strip any _1, _2 suffixes and header comments)
           basename_file=$(basename "$file")
-          # Try to find the original source file name from the header
           original_name=$(grep "^// Source:" "$file" 2>/dev/null | sed 's/.*\///' || echo "$basename_file")
           if [ -z "$original_name" ]; then
             original_name="$basename_file"
@@ -89,13 +76,11 @@ validate_yara_rules:
           PROCESSED_FILES="$PROCESSED_FILES $original_name"
         done
       fi
-      
-      # Get failed files
+    - |
       if [ -d "$FAILED_DIR" ] && [ -n "$(ls -A "$FAILED_DIR" 2>/dev/null)" ]; then
         echo "❌ Found failed files:"
         for file in "$FAILED_DIR"/*; do
           [ -f "$file" ] || continue
-          # Extract original filename
           basename_file=$(basename "$file")
           original_name=$(grep "^// Source:" "$file" 2>/dev/null | sed 's/.*\///' || echo "$basename_file")
           if [ -z "$original_name" ]; then
@@ -105,11 +90,8 @@ validate_yara_rules:
           PROCESSED_FILES="$PROCESSED_FILES $original_name"
         done
       fi
-      
-      # Remove duplicates from PROCESSED_FILES list
-      PROCESSED_FILES=$(echo "$PROCESSED_FILES" | tr ' ' '\n' | sort -u | tr '\n' ' ')
-      
-      # Delete all processed files from NEW_RULES_DIR
+    - PROCESSED_FILES=$(echo "$PROCESSED_FILES" | tr ' ' '\n' | sort -u | tr '\n' ' ')
+    - |
       if [ -n "$PROCESSED_FILES" ]; then
         echo "🗑️  Removing processed files from $NEW_RULES_DIR:"
         for filename in $PROCESSED_FILES; do
@@ -122,21 +104,14 @@ validate_yara_rules:
       else
         echo "⚠️  No processed files identified for cleanup"
       fi
-      
-      # Alternatively, just remove ALL .yar/.yara/.rule files from NEW_RULES_DIR
-      # since they've all been processed (either validated or failed)
-      echo "🗑️  Removing all YARA files from $NEW_RULES_DIR:"
-      find "$NEW_RULES_DIR" -type f \( -name "*.yar" -o -name "*.yara" -o -name "*.rule" \) -delete
-      
-      # Count files after cleanup
+    - echo "🗑️  Removing all YARA files from $NEW_RULES_DIR:"
+    - find "$NEW_RULES_DIR" -type f \( -name "*.yar" -o -name "*.yara" -o -name "*.rule" \) -delete
+    - |
       FILES_AFTER=$(find "$NEW_RULES_DIR" -type f \( -name "*.yar" -o -name "*.yara" -o -name "*.rule" \) | wc -l)
       echo "📊 Files in $NEW_RULES_DIR after cleanup: $FILES_AFTER"
       echo "📊 Files removed: $((FILES_BEFORE - FILES_AFTER))"
-    
     - echo "📊 Remaining files in $NEW_RULES_DIR:"
     - ls -la "$NEW_RULES_DIR" || echo "Directory empty or not found"
-    
-    # Exit with validation result
     - exit $VALIDATION_EXIT_CODE
  
   artifacts:
@@ -159,13 +134,10 @@ push_to_repo:
     - job: validate_yara_rules
       artifacts: true
   rules:
-    # Run if we're on staging AND there were changes in NEW_RULES_DIR
-    - if: '$CI_COMMIT_BRANCH == "staging"'
+    - if: '$CI_COMMIT_BRANCH'
       changes:
         - "$NEW_RULES_DIR/**"
       when: on_success
-  #tags:
-  #  - yaralyzer
   script:
     - echo "📤 Pushing validation results to repository"
     
@@ -192,13 +164,70 @@ push_to_repo:
     # Pull latest changes to avoid conflicts
     - git pull origin $CI_COMMIT_REF_NAME --rebase || true
     
+    # Remove processed files from NEW_RULES_DIR and stage deletions
+    - echo "🗑️ Removing processed files from $NEW_RULES_DIR"
+    - |
+      REMOVED_COUNT=0
+      
+      # Remove validated files from NEW_RULES_DIR
+      if [ -d "$VALIDATED_DIR" ] && [ -n "$(ls -A "$VALIDATED_DIR" 2>/dev/null)" ]; then
+        echo "✅ Processing validated files..."
+        for file in "$VALIDATED_DIR"/*; do
+          [ -f "$file" ] || continue
+          
+          # Extract the original source filename from the header comment
+          original_name=$(grep "^// Source:" "$file" 2>/dev/null | sed 's/^.*\///' | head -1)
+          
+          # If we can't find it in the header, fall back to the basename (strip _N suffixes)
+          if [ -z "$original_name" ]; then
+            basename_file=$(basename "$file")
+            # Remove _1, _2, _3, etc. suffixes before extension
+            original_name=$(echo "$basename_file" | sed 's/_[0-9]\+\(\.[^.]*\)$/\1/')
+          fi
+          
+          source_file="$NEW_RULES_DIR/$original_name"
+          
+          if [ -f "$source_file" ]; then
+            echo "  🗑️  Removing validated: $original_name"
+            git rm -f "$source_file" 2>/dev/null || rm -f "$source_file"
+            REMOVED_COUNT=$((REMOVED_COUNT + 1))
+          fi
+        done
+      fi
+      
+      # Remove failed files from NEW_RULES_DIR
+      if [ -d "$FAILED_DIR" ] && [ -n "$(ls -A "$FAILED_DIR" 2>/dev/null)" ]; then
+        echo "❌ Processing failed files..."
+        for file in "$FAILED_DIR"/*; do
+          [ -f "$file" ] || continue
+          
+          # Extract the original source filename from the header comment
+          original_name=$(grep "^// Source:" "$file" 2>/dev/null | sed 's/^.*\///' | head -1)
+          
+          # If we can't find it in the header, fall back to the basename (strip _N suffixes)
+          if [ -z "$original_name" ]; then
+            basename_file=$(basename "$file")
+            # Remove _1, _2, _3, etc. suffixes before extension
+            original_name=$(echo "$basename_file" | sed 's/_[0-9]\+\(\.[^.]*\)$/\1/')
+          fi
+          
+          source_file="$NEW_RULES_DIR/$original_name"
+          
+          if [ -f "$source_file" ]; then
+            echo "  🗑️  Removing failed: $original_name"
+            git rm -f "$source_file" 2>/dev/null || rm -f "$source_file"
+            REMOVED_COUNT=$((REMOVED_COUNT + 1))
+          fi
+        done
+      fi
+      
+      echo "📊 Total files removed from $NEW_RULES_DIR: $REMOVED_COUNT"
+    
     # Stage files
     - git add "$VALIDATED_DIR/" || true
     - git add "$FAILED_DIR/" || true
     - git add "$JSON_REPORT" || true
     - git add "$MD_REPORT" || true
-    
-    # Also stage the now-empty NEW_RULES_DIR to commit the deletions
     - git add "$NEW_RULES_DIR/" || true
     
     # Show what we're committing
@@ -211,3 +240,96 @@ push_to_repo:
     - echo "✅ Successfully pushed to ${CI_COMMIT_REF_NAME}"
   
   allow_failure: true
+
+# ==============================================================================
+# STAGE 3: INTEGRATE TO BASELINE
+# ==============================================================================
+integrate_to_baseline:
+  stage: integrate
+  needs:
+    - job: validate_yara_rules
+      artifacts: true
+    - job: push_to_repo
+  rules:
+    - if: '$CI_COMMIT_BRANCH'
+      changes:
+        - "$NEW_RULES_DIR/**"
+      when: on_success
+  image: $PYTHON_IMAGE
+  <<: *python_setup
+  script:
+    - echo "📦 Integrating validated rules to baseline"
+    
+    # Check if we have validated rules to integrate
+    - |
+      if [ ! -d "$VALIDATED_DIR" ] || [ -z "$(ls -A "$VALIDATED_DIR" 2>/dev/null)" ]; then
+        echo "⚠️  No validated rules to integrate"
+        exit 0
+      fi
+    
+    - VALIDATED_COUNT=$(find "$VALIDATED_DIR" -type f \( -name "*.yar" -o -name "*.yara" -o -name "*.rule" \) | wc -l)
+    - echo "✅ Found $VALIDATED_COUNT validated rule(s) to integrate"
+    
+    # Step 1: Update the database with new rules
+    - echo "📊 Updating database with validated rules..."
+    - |
+      python3 "Yara Rules/Tools/build_rule_database.py" "$VALIDATED_DIR" \
+        --database "$DATABASE_PATH" \
+        --verbose
+    
+    # Step 2: Move validated rules to baseline directory
+    - echo "📁 Moving validated rules to baseline directory..."
+    - mkdir -p "$BASELINE_DIR"
+    - |
+      MOVED_COUNT=0
+      for file in "$VALIDATED_DIR"/*; do
+        [ -f "$file" ] || continue
+        
+        filename=$(basename "$file")
+        dest_path="$BASELINE_DIR/$filename"
+        
+        # Check if file already exists in baseline
+        if [ -f "$dest_path" ]; then
+          echo "  ⚠️  File already exists in baseline: $filename (skipping)"
+          continue
+        fi
+        
+        # Move the file
+        mv "$file" "$dest_path"
+        echo "  ✅ Moved: $filename → Baseline_Rules/"
+        MOVED_COUNT=$((MOVED_COUNT + 1))
+      done
+      
+      echo "📊 Total rules moved to baseline: $MOVED_COUNT"
+    
+    # Step 3: Commit and push changes
+    - echo "📤 Committing baseline updates to repository"
+    - git config --global user.email "${user_email}"
+    - git config --global user.name "${user_name}"
+    - git config --global http.sslcainfo "${SSL_CERT_FILE_PATH}"
+    - git remote set-url origin https://alesher:${PAT_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git
+    
+    # Pull latest changes
+    - git pull origin $CI_COMMIT_REF_NAME --rebase || true
+    
+    # Stage changes
+    - git add "$BASELINE_DIR/" || true
+    - git add "$DATABASE_PATH" || true
+    - git add "$VALIDATED_DIR/" || true
+    
+    # Show what we're committing
+    - echo "📝 Files to be committed:"
+    - git status --short
+    
+    # Commit and push
+    - |
+      if git diff --cached --quiet; then
+        echo "⚠️  No changes to commit"
+        exit 0
+      fi
+    
+    - git commit -m "CI: Integrate validated rules to baseline [skip ci]" || (echo "Nothing to commit" && exit 0)
+    - git push origin HEAD:${CI_COMMIT_REF_NAME}
+    - echo "✅ Successfully integrated rules to baseline"
+  
+  allow_failure: false
