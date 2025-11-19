@@ -779,95 +779,94 @@ class FileValidator:
         
         return not has_errors
     
-    def _deduplicate_file_content(self, yara_file):  # <-- This needs proper indentation!
+    def _deduplicate_file_content(self, yara_file):
         """Deduplicate rules within a file's content."""
         if not yara_file.content:
             return yara_file.content, False
-    
-    imports, rule_sources = parse_yara_file_to_rules(yara_file.filepath)
-    
-    kept_rules = []
-    changed = False
-    
-    for rule_source in rule_sources:
-        rule_name_match = re.search(r'(?i)^\s*(?:private\s+|global\s+)?rule\s+(\w+)', rule_source, re.MULTILINE)
-        if not rule_name_match:
-            kept_rules.append(rule_source)
-            continue
         
-        rule_name = rule_name_match.group(1)
+        imports, rule_sources = parse_yara_file_to_rules(yara_file.filepath)
         
-        # NEW: Check against baseline database first
-        if self.baseline_checker and self.baseline_checker.enabled:
-            from Yaralyzer import RuleFingerprint  # Use existing class
-            fingerprint = RuleFingerprint(rule_source)
-            rule_hash = fingerprint.hash
-            
-            exists_in_baseline, baseline_info = self.baseline_checker.check_rule(
-                rule_name, rule_hash, yara_file.filepath
-            )
-            
-            if exists_in_baseline:
-                changed = True
-                print(f"  🔍 Rule '{rule_name}' already exists in baseline: {os.path.basename(baseline_info.baseline_file)}")
-                continue  # Skip this rule, it's already in baseline
+        kept_rules = []
+        changed = False
         
-        # Existing deduplication logic
-        if self.enable_deduplication:
-            should_keep, new_name, duplicate_info = self.dedup_tracker.register_rule(
-                rule_name,
-                rule_source,
-                yara_file.filepath
-            )
-            
-            if not should_keep:
-                changed = True
-                if duplicate_info and duplicate_info.duplicate_type == DuplicateInfo.TYPE_CONTENT_DUPLICATE:
-                    print(f"  🗑️  Removing content duplicate: '{rule_name}' (identical to '{duplicate_info.original_name}') from {os.path.basename(yara_file.filepath)}")
-                else:
-                    print(f"  🗑️  Removing duplicate: '{rule_name}' from {os.path.basename(yara_file.filepath)}")
+        for rule_source in rule_sources:
+            rule_name_match = re.search(r'(?i)^\s*(?:private\s+|global\s+)?rule\s+(\w+)', rule_source, re.MULTILINE)
+            if not rule_name_match:
+                kept_rules.append(rule_source)
                 continue
-            elif new_name:
-                changed = True
-                print(f"  🔄 Renaming: '{rule_name}' → '{new_name}' in {os.path.basename(yara_file.filepath)}")
+            
+            rule_name = rule_name_match.group(1)
+            
+            # NEW: Check against baseline database first
+            if self.baseline_checker and self.baseline_checker.enabled:
+                fingerprint = RuleFingerprint(rule_source)
+                rule_hash = fingerprint.hash
                 
-                renamed_source = re.sub(
-                    r'(?i)(^\s*(?:private\s+|global\s+)?rule\s+)(\w+)',
-                    r'\g<1>' + new_name,
-                    rule_source,
-                    count=1,
-                    flags=re.MULTILINE
+                exists_in_baseline, baseline_info = self.baseline_checker.check_rule(
+                    rule_name, rule_hash, yara_file.filepath
                 )
-                kept_rules.append(renamed_source)
+                
+                if exists_in_baseline:
+                    changed = True
+                    print(f"  🔍 Rule '{rule_name}' already exists in baseline: {os.path.basename(baseline_info.baseline_file)}")
+                    continue  # Skip this rule, it's already in baseline
+            
+            # Existing deduplication logic
+            if self.enable_deduplication:
+                should_keep, new_name, duplicate_info = self.dedup_tracker.register_rule(
+                    rule_name,
+                    rule_source,
+                    yara_file.filepath
+                )
+                
+                if not should_keep:
+                    changed = True
+                    if duplicate_info and duplicate_info.duplicate_type == DuplicateInfo.TYPE_CONTENT_DUPLICATE:
+                        print(f"  🗑️  Removing content duplicate: '{rule_name}' (identical to '{duplicate_info.original_name}') from {os.path.basename(yara_file.filepath)}")
+                    else:
+                        print(f"  🗑️  Removing duplicate: '{rule_name}' from {os.path.basename(yara_file.filepath)}")
+                    continue
+                elif new_name:
+                    changed = True
+                    print(f"  🔄 Renaming: '{rule_name}' → '{new_name}' in {os.path.basename(yara_file.filepath)}")
+                    
+                    renamed_source = re.sub(
+                        r'(?i)(^\s*(?:private\s+|global\s+)?rule\s+)(\w+)',
+                        r'\g<1>' + new_name,
+                        rule_source,
+                        count=1,
+                        flags=re.MULTILINE
+                    )
+                    kept_rules.append(renamed_source)
+                else:
+                    kept_rules.append(rule_source)
             else:
                 kept_rules.append(rule_source)
-        else:
-            kept_rules.append(rule_source)
-    
-    if changed:
-        # Only add header and content if there are rules left
-        if kept_rules:
-            header = "// This file has been processed\n"
-            if self.baseline_checker and self.baseline_checker.enabled:
-                header += "// Checked against baseline database\n"
-            if self.enable_deduplication:
-                header += "// Deduplicated\n"
-            header += f"// Original: {yara_file.filepath}\n"
-            header += f"// Processed: {datetime.now().isoformat()}\n\n"
-            
-            new_content = header
-            
-            if imports:
-                new_content += imports + "\n\n"
-            
-            new_content += "\n\n".join(kept_rules)
-        else:
-            # File is now empty after processing
-            new_content = ""
         
-        return new_content, True
-    else:
-        return yara_file.content, False
+        if changed:
+            # Only add header and content if there are rules left
+            if kept_rules:
+                header = "// This file has been processed\n"
+                if self.baseline_checker and self.baseline_checker.enabled:
+                    header += "// Checked against baseline database\n"
+                if self.enable_deduplication:
+                    header += "// Deduplicated\n"
+                header += f"// Original: {yara_file.filepath}\n"
+                header += f"// Processed: {datetime.now().isoformat()}\n\n"
+                
+                new_content = header
+                
+                if imports:
+                    new_content += imports + "\n\n"
+                
+                new_content += "\n\n".join(kept_rules)
+            else:
+                # File is now empty after processing
+                new_content = ""
+            
+            return new_content, True
+        else:
+            return yara_file.content, False
     
     def validate_file(self, yara_file):
         """Validate a single YARA file."""
