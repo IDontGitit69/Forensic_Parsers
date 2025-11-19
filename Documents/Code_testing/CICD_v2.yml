@@ -1,68 +1,3 @@
-# GitLab CI/CD Pipeline for YARA Rule Validation and Deployment
- 
-stages:
-  - validate
-  - push
-
-variables:
-  # Directories
-  NEW_RULES_DIR: "Yara Rules/New Rules"
-  VALIDATED_DIR: "Yara Rules/validated"
-  FAILED_DIR: "Yara Rules/failed"
-  BASELINE_FILE: "Yara Rules/Master_Rules_List.yar"
-  GIT_DEPTH: 0
-  
-  # Report files
-  JSON_REPORT: "Yara Rules/validation_report.json"
-  MD_REPORT: "Yara Rules/validation_report.md"
- 
-  # Python image
-  PYTHON_IMAGE: "python:3.11-slim"
- 
-# Template for Python setup
-.python_setup: &python_setup
-  before_script:
-    - pip3 install --quiet --no-cache-dir yara-python
-    - python3 --version
-    - "python3 -c \"import yara; print(f'YARA version: {yara.__version__}')\""
- 
-# ==============================================================================
-# STAGE 1: VALIDATE
-# ==============================================================================
-validate_yara_rules:
-  stage: validate
-  rules:
-    - changes:
-        - "$NEW_RULES_DIR/**"
-      when: on_success
-    - when: never
-  image: $PYTHON_IMAGE
-  #tags:
-    - yaralyzer
-  <<: *python_setup
-  script:
-    - echo "🔍 Validating YARA rules in $NEW_RULES_DIR"
-    - |
-      python3 "Yara Rules/Tools/Yaralyzer.py" "$NEW_RULES_DIR" \
-        --output-valid-dir "$VALIDATED_DIR" \
-        --output-failed-dir "$FAILED_DIR" \
-        --json-report "$JSON_REPORT" \
-        --markdown-report "$MD_REPORT" \
-        --deduplicate \
-        --verbose \
-        --require-metadata
- 
-  artifacts:
-    when: always
-    paths:
-      - $VALIDATED_DIR/
-      - $FAILED_DIR/
-      - $JSON_REPORT
-      - $MD_REPORT
-    expire_in: 7 days
- 
-  allow_failure: true
- 
 # ==============================================================================
 # STAGE 2: PUSH
 # ==============================================================================
@@ -72,28 +7,23 @@ push_to_repo:
     - job: validate_yara_rules
       artifacts: true
   rules:
-    # Run if we're on staging AND there were changes in NEW_RULES_DIR
     - if: '$CI_COMMIT_BRANCH == "staging"'
       changes:
         - "$NEW_RULES_DIR/**"
       when: on_success
-  #tags:
-  #  - yaralyzer
   script:
-    - echo "🚀 Pushing validation results to repository"
+    - echo "📤 Pushing validation results to repository"
     
     # Verify we have artifacts to push
     - |
       FILES_TO_PUSH=0
       [ -f "$JSON_REPORT" ] && FILES_TO_PUSH=$((FILES_TO_PUSH + 1))
       [ -f "$MD_REPORT" ] && FILES_TO_PUSH=$((FILES_TO_PUSH + 1))
-      [ -d "$VALIDATED_DIR" ] && [ -n "$(ls -A '$VALIDATED_DIR' 2>/dev/null)" ] && FILES_TO_PUSH=$((FILES_TO_PUSH + 1))
-      
+      [ -d "$VALIDATED_DIR" ] && [ -n "$(ls -A "$VALIDATED_DIR" 2>/dev/null)" ] && FILES_TO_PUSH=$((FILES_TO_PUSH + 1))
       if [ $FILES_TO_PUSH -eq 0 ]; then
         echo "⚠️  No files to push (validation may have failed or produced no output)"
         exit 0
       fi
-      
       echo "✅ Found $FILES_TO_PUSH artifact(s) to push"
     
     # Configure Git
@@ -102,18 +32,87 @@ push_to_repo:
     - git config --global http.sslcainfo "${SSL_CERT_FILE_PATH}"
     - git remote set-url origin https://alesher:${PAT_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git
     
+    # Pull latest changes to avoid conflicts
+    - git pull origin $CI_COMMIT_REF_NAME --rebase || true
+    
+    # ========================================================================
+    # 🆕 NEW: Remove processed files from NEW_RULES_DIR and stage deletions
+    # ========================================================================
+    - echo "🗑️ Removing processed files from $NEW_RULES_DIR"
+    - |
+      # Track how many files we remove
+      REMOVED_COUNT=0
+      
+      # Remove validated files from NEW_RULES_DIR
+      if [ -d "$VALIDATED_DIR" ] && [ -n "$(ls -A "$VALIDATED_DIR" 2>/dev/null)" ]; then
+        echo "✅ Processing validated files..."
+        for file in "$VALIDATED_DIR"/*; do
+          [ -f "$file" ] || continue
+          
+          # Extract the original source filename from the header comment
+          original_name=$(grep "^// Source:" "$file" 2>/dev/null | sed 's/^.*\///' | head -1)
+          
+          # If we can't find it in the header, fall back to the basename (strip _N suffixes)
+          if [ -z "$original_name" ]; then
+            basename_file=$(basename "$file")
+            # Remove _1, _2, _3, etc. suffixes before extension
+            original_name=$(echo "$basename_file" | sed 's/_[0-9]\+\(\.[^.]*\)$/\1/')
+          fi
+          
+          source_file="$NEW_RULES_DIR/$original_name"
+          
+          if [ -f "$source_file" ]; then
+            echo "  🗑️  Removing validated: $original_name"
+            git rm -f "$source_file" 2>/dev/null || rm -f "$source_file"
+            REMOVED_COUNT=$((REMOVED_COUNT + 1))
+          fi
+        done
+      fi
+      
+      # Remove failed files from NEW_RULES_DIR
+      if [ -d "$FAILED_DIR" ] && [ -n "$(ls -A "$FAILED_DIR" 2>/dev/null)" ]; then
+        echo "❌ Processing failed files..."
+        for file in "$FAILED_DIR"/*; do
+          [ -f "$file" ] || continue
+          
+          # Extract the original source filename from the header comment
+          original_name=$(grep "^// Source:" "$file" 2>/dev/null | sed 's/^.*\///' | head -1)
+          
+          # If we can't find it in the header, fall back to the basename (strip _N suffixes)
+          if [ -z "$original_name" ]; then
+            basename_file=$(basename "$file")
+            # Remove _1, _2, _3, etc. suffixes before extension
+            original_name=$(echo "$basename_file" | sed 's/_[0-9]\+\(\.[^.]*\)$/\1/')
+          fi
+          
+          source_file="$NEW_RULES_DIR/$original_name"
+          
+          if [ -f "$source_file" ]; then
+            echo "  🗑️  Removing failed: $original_name"
+            git rm -f "$source_file" 2>/dev/null || rm -f "$source_file"
+            REMOVED_COUNT=$((REMOVED_COUNT + 1))
+          fi
+        done
+      fi
+      
+      echo "📊 Total files removed from $NEW_RULES_DIR: $REMOVED_COUNT"
+    # ========================================================================
+    # END NEW SECTION
+    # ========================================================================
+    
     # Stage files
     - git add "$VALIDATED_DIR/" || true
     - git add "$FAILED_DIR/" || true
     - git add "$JSON_REPORT" || true
     - git add "$MD_REPORT" || true
+    - git add "$NEW_RULES_DIR/" || true
     
     # Show what we're committing
     - echo "📝 Files to be committed:"
     - git status --short
     
     # Commit and push (exit gracefully if nothing to commit)
-    - git commit -m "CI Add validated YARA rules and reports [skip ci]" || (echo "Nothing to commit" && exit 0)
+    - git commit -m "CI: Add validated YARA rules and reports [skip ci]" || (echo "Nothing to commit" && exit 0)
     - git push origin HEAD:${CI_COMMIT_REF_NAME}
     - echo "✅ Successfully pushed to ${CI_COMMIT_REF_NAME}"
   
