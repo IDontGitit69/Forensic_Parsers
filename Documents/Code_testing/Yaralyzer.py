@@ -779,10 +779,10 @@ class FileValidator:
         
         return not has_errors
     
-def _deduplicate_file_content(self, yara_file):
+    def _deduplicate_file_content(self, yara_file):
     """Deduplicate rules within a file's content."""
-    if not yara_file.content:
-        return yara_file.content, False
+       if not yara_file.content:
+           return yara_file.content, False
     
     imports, rule_sources = parse_yara_file_to_rules(yara_file.filepath)
     
