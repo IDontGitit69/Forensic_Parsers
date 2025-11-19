@@ -46,6 +46,13 @@ from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
 
+# Add this import near the top with other imports
+try:
+    from rule_database import RuleDatabaseChecker
+    DATABASE_SUPPORT = True
+except ImportError:
+    DATABASE_SUPPORT = False
+    print("⚠️  Warning: rule_database module not found. Database checking disabled.")
 try:
     import yara
 except ImportError:
@@ -433,7 +440,88 @@ class DeduplicationTracker:
             'removals': self.removals
         }
 
+# ============================================================================
+# BASELINE DATABASE CHECKING
+# ============================================================================
 
+class BaselineDuplicateInfo:
+    """Tracks information about rules that already exist in baseline."""
+    
+    def __init__(self, rule_name, rule_hash, baseline_file, baseline_rule_name=None):
+        self.rule_name = rule_name
+        self.rule_hash = rule_hash
+        self.baseline_file = baseline_file
+        self.baseline_rule_name = baseline_rule_name  # In case names differ
+        self.new_file = None
+    
+    def to_dict(self):
+        result = {
+            'rule_name': self.rule_name,
+            'hash': self.rule_hash[:16],
+            'baseline_file': self.baseline_file,
+            'new_file': self.new_file,
+            'status': 'already_in_baseline'
+        }
+        if self.baseline_rule_name and self.baseline_rule_name != self.rule_name:
+            result['baseline_rule_name'] = self.baseline_rule_name
+        return result
+
+
+class BaselineChecker:
+    """Checks new rules against baseline database."""
+    
+    def __init__(self, db_path=None):
+        self.db_path = db_path
+        self.db_checker = None
+        self.baseline_duplicates = []
+        self.enabled = False
+        
+        if db_path and DATABASE_SUPPORT:
+            self.db_checker = RuleDatabaseChecker(db_path)
+            if self.db_checker.connect():
+                self.enabled = True
+                print(f"✅ Connected to baseline database: {db_path}")
+            else:
+                print(f"⚠️  Could not connect to baseline database")
+    
+    def check_rule(self, rule_name, rule_hash, source_file):
+        """
+        Check if rule exists in baseline.
+        Returns: (exists_in_baseline, baseline_info)
+        """
+        if not self.enabled:
+            return False, None
+        
+        # Check by hash first (content duplicate)
+        result = self.db_checker.rule_exists_by_hash(rule_hash)
+        
+        if result:
+            baseline_rule_name, baseline_file = result
+            
+            baseline_info = BaselineDuplicateInfo(
+                rule_name=rule_name,
+                rule_hash=rule_hash,
+                baseline_file=baseline_file,
+                baseline_rule_name=baseline_rule_name
+            )
+            baseline_info.new_file = source_file
+            
+            self.baseline_duplicates.append(baseline_info)
+            return True, baseline_info
+        
+        return False, None
+    
+    def get_statistics(self):
+        """Get baseline checking statistics."""
+        return {
+            'total_baseline_duplicates': len(self.baseline_duplicates),
+            'duplicates': [d.to_dict() for d in self.baseline_duplicates]
+        }
+    
+    def close(self):
+        """Close database connection."""
+        if self.db_checker:
+            self.db_checker.close()
 # ============================================================================
 # YARA FILE REPRESENTATION
 # ============================================================================
@@ -642,13 +730,14 @@ def parse_yara_file_to_rules(filepath):
 class FileValidator:
     """Validates complete YARA files."""
     
-    def __init__(self, enable_deduplication=False, require_metadata=False):
+    def __init__(self, enable_deduplication=False, require_metadata=False, baseline_db_path=None):
         self.files = []
         self.all_rule_names = {}
         self.enable_deduplication = enable_deduplication
         self.require_metadata = require_metadata
         self.dedup_tracker = DeduplicationTracker() if enable_deduplication else None
         self.metadata_validator = MetadataValidator() if require_metadata else None
+        self.baseline_checker = BaselineChecker(baseline_db_path) if baseline_db_path else None
     
     def add_file(self, filepath):
         """Add a YARA file for validation."""
@@ -690,24 +779,41 @@ class FileValidator:
         
         return not has_errors
     
-    def _deduplicate_file_content(self, yara_file):
-        """Deduplicate rules within a file's content."""
-        if not self.enable_deduplication or not yara_file.content:
-            return yara_file.content, False
+def _deduplicate_file_content(self, yara_file):
+    """Deduplicate rules within a file's content."""
+    if not yara_file.content:
+        return yara_file.content, False
+    
+    imports, rule_sources = parse_yara_file_to_rules(yara_file.filepath)
+    
+    kept_rules = []
+    changed = False
+    
+    for rule_source in rule_sources:
+        rule_name_match = re.search(r'(?i)^\s*(?:private\s+|global\s+)?rule\s+(\w+)', rule_source, re.MULTILINE)
+        if not rule_name_match:
+            kept_rules.append(rule_source)
+            continue
         
-        imports, rule_sources = parse_yara_file_to_rules(yara_file.filepath)
+        rule_name = rule_name_match.group(1)
         
-        kept_rules = []
-        changed = False
-        
-        for rule_source in rule_sources:
-            rule_name_match = re.search(r'(?i)^\s*(?:private\s+|global\s+)?rule\s+(\w+)', rule_source, re.MULTILINE)
-            if not rule_name_match:
-                kept_rules.append(rule_source)
-                continue
+        # NEW: Check against baseline database first
+        if self.baseline_checker and self.baseline_checker.enabled:
+            from validate_yara_rules import RuleFingerprint  # Use existing class
+            fingerprint = RuleFingerprint(rule_source)
+            rule_hash = fingerprint.hash
             
-            rule_name = rule_name_match.group(1)
+            exists_in_baseline, baseline_info = self.baseline_checker.check_rule(
+                rule_name, rule_hash, yara_file.filepath
+            )
             
+            if exists_in_baseline:
+                changed = True
+                print(f"  🔍 Rule '{rule_name}' already exists in baseline: {os.path.basename(baseline_info.baseline_file)}")
+                continue  # Skip this rule, it's already in baseline
+        
+        # Existing deduplication logic
+        if self.enable_deduplication:
             should_keep, new_name, duplicate_info = self.dedup_tracker.register_rule(
                 rule_name,
                 rule_source,
@@ -735,27 +841,33 @@ class FileValidator:
                 kept_rules.append(renamed_source)
             else:
                 kept_rules.append(rule_source)
-        
-        if changed:
-            # Only add header and content if there are rules left
-            if kept_rules:
-                header = "// This file has been processed for deduplication\n"
-                header += f"// Original: {yara_file.filepath}\n"
-                header += f"// Processed: {datetime.now().isoformat()}\n\n"
-                
-                new_content = header
-                
-                if imports:
-                    new_content += imports + "\n\n"
-                
-                new_content += "\n\n".join(kept_rules)
-            else:
-                # File is now empty after deduplication
-                new_content = ""
-            
-            return new_content, True
         else:
-            return yara_file.content, False
+            kept_rules.append(rule_source)
+    
+    if changed:
+        # Only add header and content if there are rules left
+        if kept_rules:
+            header = "// This file has been processed\n"
+            if self.baseline_checker and self.baseline_checker.enabled:
+                header += "// Checked against baseline database\n"
+            if self.enable_deduplication:
+                header += "// Deduplicated\n"
+            header += f"// Original: {yara_file.filepath}\n"
+            header += f"// Processed: {datetime.now().isoformat()}\n\n"
+            
+            new_content = header
+            
+            if imports:
+                new_content += imports + "\n\n"
+            
+            new_content += "\n\n".join(kept_rules)
+        else:
+            # File is now empty after processing
+            new_content = ""
+        
+        return new_content, True
+    else:
+        return yara_file.content, False
     
     def validate_file(self, yara_file):
         """Validate a single YARA file."""
@@ -1129,7 +1241,7 @@ def write_failed_rules(rules, output_dir):
 # ============================================================================
 
 def generate_json_report(valid_files_or_rules, broken_files_or_rules, duplicates, dedup_data, 
-                        output_file, mode='file', require_metadata=False):
+                        output_file, mode='file', require_metadata=False, baseline_data=None):
     """Generate JSON report for validation."""
     total = len(valid_files_or_rules) + len(broken_files_or_rules)
     
@@ -1178,7 +1290,10 @@ def generate_json_report(valid_files_or_rules, broken_files_or_rules, duplicates
     # Add deduplication data if available
     if dedup_data:
         report['deduplication'] = dedup_data
-    
+        # NEW: Add baseline checking data if available
+    if baseline_data:
+        report['baseline_check'] = baseline_data
+       
     os.makedirs(os.path.dirname(output_file) if os.path.dirname(output_file) else '.', exist_ok=True)
     with open(output_file, 'w', encoding='utf-8') as f:
         json.dump(report, f, indent=2)
@@ -1187,7 +1302,7 @@ def generate_json_report(valid_files_or_rules, broken_files_or_rules, duplicates
 
 
 def generate_markdown_report(valid_files_or_rules, broken_files_or_rules, duplicates, dedup_tracker, 
-                            output_file, mode='file', require_metadata=False):
+                            output_file, mode='file', require_metadata=False, baseline_checker=None):
     """Generate Markdown report for validation."""
     with open(output_file, 'w', encoding='utf-8') as f:
         f.write("# YARA Validation Report\n\n")
@@ -1197,6 +1312,8 @@ def generate_markdown_report(valid_files_or_rules, broken_files_or_rules, duplic
             f.write(" with deduplication")
         if require_metadata:
             f.write(" + metadata validation")
+        if baseline_checker and baseline_checker.enabled:
+            f.write(" + baseline checking")
         f.write("\n\n")
         
         # Summary
@@ -1227,7 +1344,24 @@ def generate_markdown_report(valid_files_or_rules, broken_files_or_rules, duplic
                 f.write(f"| 📋 Content Duplicates | {stats['content_duplicates']} |\n")
         
         f.write(f"| Success Rate | {success_rate}% |\n\n")
-        
+                # NEW: Baseline checking report
+        if baseline_checker and baseline_checker.enabled:
+            stats = baseline_checker.get_statistics()
+            if stats['total_baseline_duplicates'] > 0:
+                f.write("## 🔍 Baseline Database Check\n\n")
+                f.write(f"**Rules Already in Baseline:** {stats['total_baseline_duplicates']}\n\n")
+                f.write("The following rules already exist in the baseline database and were skipped:\n\n")
+                
+                for dup in stats['duplicates']:
+                    f.write(f"### `{dup['rule_name']}`\n\n")
+                    f.write(f"- **Hash:** `{dup['hash']}`\n")
+                    f.write(f"- **New File:** `{dup['new_file']}`\n")
+                    f.write(f"- **Baseline File:** `{dup['baseline_file']}`\n")
+                    if 'baseline_rule_name' in dup:
+                        f.write(f"- **Baseline Rule Name:** `{dup['baseline_rule_name']}`\n")
+                    f.write(f"- **Status:** ✅ Already in baseline (skipped)\n\n")
+                
+                f.write("---\n\n")
         # Status
         if len(broken_files_or_rules) == 0 and (not duplicates or dedup_tracker):
             f.write("**Status:** ✅ All validated successfully")
@@ -1393,7 +1527,7 @@ def generate_markdown_report(valid_files_or_rules, broken_files_or_rules, duplic
 # ============================================================================
 
 def validate_files_mode(directory, verbose=False, enable_deduplication=False, require_metadata=False,
-                       output_valid_dir=None, output_failed_dir=None,
+                       baseline_db_path=None, output_valid_dir=None, output_failed_dir=None,
                        json_report=None, markdown_report=None):
     """Validate entire files (default mode)."""
     
@@ -1403,6 +1537,8 @@ def validate_files_mode(directory, verbose=False, enable_deduplication=False, re
         mode_parts.append("DEDUPLICATION")
     if require_metadata:
         mode_parts.append("METADATA VALIDATION")
+    if baseline_db_path:
+        mode_parts.append("BASELINE CHECKING")
     mode_name = " + ".join(mode_parts)
     
     print("="*80)
@@ -1428,8 +1564,12 @@ def validate_files_mode(directory, verbose=False, enable_deduplication=False, re
     
     print(f"\n📁 Found {len(yara_files)} YARA file(s)")
     
-    validator = FileValidator(enable_deduplication=enable_deduplication, require_metadata=require_metadata)
-    
+    validator = FileValidator(enable_deduplication=enable_deduplication, require_metadata=require_metadata, baseline_db_path=baseline_db_path)
+    if validator.baseline_checker and validator.baseline_checker.enabled:
+        baseline_stats = validator.baseline_checker.get_statistics()
+        if baseline_stats['total_baseline_duplicates'] > 0:
+            print(f"🔍 Baseline check: {baseline_stats['total_baseline_duplicates']} rule(s) already in baseline")
+                          
     print("\n📥 Loading files...")
     for filepath in yara_files:
         try:
@@ -1497,15 +1637,21 @@ def validate_files_mode(directory, verbose=False, enable_deduplication=False, re
     if json_report:
         print(f"\n📝 Generating JSON report: {json_report}")
         dedup_data = validator.get_deduplication_report().to_dict() if enable_deduplication else None
+        baseline_data = validator.baseline_checker.get_statistics() if validator.baseline_checker else None
         generate_json_report(valid_files, broken_files, duplicates, dedup_data, 
-                           json_report, mode='file', require_metadata=require_metadata)
+                           json_report, mode='file', require_metadata=require_metadata,
+                           baseline_data=baseline_data)
     
     if markdown_report:
         print(f"\n📝 Generating Markdown report: {markdown_report}")
         dedup_data = validator.get_deduplication_report() if enable_deduplication else None
         generate_markdown_report(valid_files, broken_files, duplicates, dedup_data, 
-                               markdown_report, mode='file', require_metadata=require_metadata)
-    
+                               markdown_report, mode='file', require_metadata=require_metadata,
+                               baseline_checker=validator.baseline_checker)
+        # Clean up
+    if validator.baseline_checker:
+        validator.baseline_checker.close()
+       
     print("\n" + "="*80)
     if broken_files:
         print(f"⚠️  Validation completed with {len(broken_files)} failure(s)")
@@ -1718,7 +1864,10 @@ EXAMPLES:
     
     parser.add_argument('--markdown-report', metavar='FILE',
                        help='Generate Markdown report')
-    
+                          
+    parser.add_argument('--baseline-db', metavar='PATH',
+                       help='Path to baseline database for duplicate checking (e.g., ../database/yara_rules.db)')
+ 
     args = parser.parse_args()
     
     # Show metadata template if requested
@@ -1753,6 +1902,7 @@ EXAMPLES:
                 verbose=args.verbose,
                 enable_deduplication=args.deduplicate,
                 require_metadata=args.require_metadata,
+                baseline_db_path=args.baseline_db,  # NEW
                 output_valid_dir=args.output_valid_dir,
                 output_failed_dir=args.output_failed_dir,
                 json_report=args.json_report,
@@ -1764,6 +1914,7 @@ EXAMPLES:
                 verbose=args.verbose,
                 enable_deduplication=args.deduplicate,
                 require_metadata=args.require_metadata,
+                baseline_db_path=args.baseline_db,  # NEW
                 output_valid_dir=args.output_valid_dir,
                 output_failed_dir=args.output_failed_dir,
                 json_report=args.json_report,
