@@ -1,164 +1,3 @@
-# GitLab CI/CD Pipeline for YARA Rule Validation and Deployment
-
-stages:
-  - validate
-  - integrate
-
-variables:
-  # Directories
-  NEW_RULES_DIR: "Yara Rules/New Rules"
-  BASELINE_DIR: "Yara Rules/Baseline_Rules"
-  REJECTED_DIR: "Yara Rules/Rejected_Rules"
-  DATABASE_PATH: "Yara Rules/database/yara_rules.db"
-  GIT_DEPTH: 0
-  
-  # Report files
-  JSON_REPORT: "Yara Rules/validation_report.json"
-  MD_REPORT: "Yara Rules/validation_report.md"
- 
-  # Python image
-  PYTHON_IMAGE: "python:3.11-slim"
- 
-# Template for Python setup
-.python_setup: &python_setup
-  before_script:
-    - pip3 install --quiet --no-cache-dir yara-python
-    - python3 --version
-    - python3 -c "import yara; print(f'YARA version: {yara.__version__}')"
- 
-# ==============================================================================
-# STAGE 1: VALIDATE
-# ==============================================================================
-validate_yara_rules:
-  stage: validate
-  rules:
-    - changes:
-        - "$NEW_RULES_DIR/**"
-      when: on_success
-    - when: never
-  image: $PYTHON_IMAGE
-  <<: *python_setup
-  script:
-    - echo "🔍 Validating YARA rules in $NEW_RULES_DIR"
-    
-    # Clear previous rejected rules
-    - echo "🧹 Clearing previous rejected rules"
-    - rm -rf "$REJECTED_DIR"
-    - mkdir -p "$REJECTED_DIR"
-    
-    # Ensure baseline directory exists
-    - mkdir -p "$BASELINE_DIR"
-    
-    # Run validation - valid rules go directly to Baseline_Rules, failed go to Rejected_Rules
-    - |
-      python3 "Yara Rules/Tools/Yaralyzer.py" "$NEW_RULES_DIR" \
-        --output-valid-dir "$BASELINE_DIR" \
-        --output-failed-dir "$REJECTED_DIR" \
-        --json-report "$JSON_REPORT" \
-        --markdown-report "$MD_REPORT" \
-        --deduplicate \
-        --verbose \
-        --require-metadata \
-        --baseline-db "$DATABASE_PATH"
-    
-    - VALIDATION_EXIT_CODE=$?
-    - echo "Validation exit code=$VALIDATION_EXIT_CODE"
-    
-    # Report what happened
-    - |
-      VALID_COUNT=0
-      REJECTED_COUNT=0
-      
-      if [ -d "$BASELINE_DIR" ]; then
-        VALID_COUNT=$(find "$BASELINE_DIR" -type f \( -name "*.yar" -o -name "*.yara" -o -name "*.rule" \) -newer "$JSON_REPORT" 2>/dev/null | wc -l)
-        echo "✅ Valid rules (moved to Baseline_Rules): $VALID_COUNT"
-      fi
-      
-      if [ -d "$REJECTED_DIR" ] && [ -n "$(ls -A "$REJECTED_DIR" 2>/dev/null)" ]; then
-        REJECTED_COUNT=$(find "$REJECTED_DIR" -type f \( -name "*.yar" -o -name "*.yara" -o -name "*.rule" \) | wc -l)
-        echo "❌ Rejected rules (moved to Rejected_Rules): $REJECTED_COUNT"
-      fi
-    
-    # Clean up processed files from New_Rules
-    - echo "🧹 Cleaning up processed files from $NEW_RULES_DIR"
-    - |
-      FILES_BEFORE=$(find "$NEW_RULES_DIR" -type f \( -name "*.yar" -o -name "*.yara" -o -name "*.rule" \) | wc -l)
-      echo "📊 Files in $NEW_RULES_DIR before cleanup: $FILES_BEFORE"
-    
-    # Remove all processed files (both valid and rejected)
-    - |
-      REMOVED_COUNT=0
-      
-      # Track files that were validated (now in baseline)
-      if [ -d "$BASELINE_DIR" ]; then
-        for file in "$BASELINE_DIR"/*; do
-          [ -f "$file" ] || continue
-          
-          # Extract original filename from header
-          original_name=$(grep "^// Source:" "$file" 2>/dev/null | sed 's/^.*\///' | head -1)
-          
-          if [ -z "$original_name" ]; then
-            basename_file=$(basename "$file")
-            original_name=$(echo "$basename_file" | sed 's/_[0-9]\+\(\.[^.]*\)$/\1/')
-          fi
-          
-          source_file="$NEW_RULES_DIR/$original_name"
-          
-          if [ -f "$source_file" ]; then
-            echo "  ✅ Removing validated: $original_name"
-            rm -f "$source_file"
-            REMOVED_COUNT=$((REMOVED_COUNT + 1))
-          fi
-        done
-      fi
-      
-      # Track files that were rejected
-      if [ -d "$REJECTED_DIR" ] && [ -n "$(ls -A "$REJECTED_DIR" 2>/dev/null)" ]; then
-        for file in "$REJECTED_DIR"/*; do
-          [ -f "$file" ] || continue
-          
-          original_name=$(grep "^// Source:" "$file" 2>/dev/null | sed 's/^.*\///' | head -1)
-          
-          if [ -z "$original_name" ]; then
-            basename_file=$(basename "$file")
-            original_name=$(echo "$basename_file" | sed 's/_[0-9]\+\(\.[^.]*\)$/\1/')
-          fi
-          
-          source_file="$NEW_RULES_DIR/$original_name"
-          
-          if [ -f "$source_file" ]; then
-            echo "  ❌ Removing rejected: $original_name"
-            rm -f "$source_file"
-            REMOVED_COUNT=$((REMOVED_COUNT + 1))
-          fi
-        done
-      fi
-      
-      echo "📊 Total files removed from $NEW_RULES_DIR: $REMOVED_COUNT"
-    
-    # Final cleanup - remove any remaining YARA files
-    - find "$NEW_RULES_DIR" -type f \( -name "*.yar" -o -name "*.yara" -o -name "*.rule" \) -delete
-    
-    - |
-      FILES_AFTER=$(find "$NEW_RULES_DIR" -type f \( -name "*.yar" -o -name "*.yara" -o -name "*.rule" \) | wc -l)
-      echo "📊 Files remaining in $NEW_RULES_DIR: $FILES_AFTER"
-    
-    - exit $VALIDATION_EXIT_CODE
- 
-  artifacts:
-    when: always
-    paths:
-      - $BASELINE_DIR/
-      - $REJECTED_DIR/
-      - $JSON_REPORT
-      - $MD_REPORT
-    expire_in: 7 days
- 
-  allow_failure: true
- 
-# ==============================================================================
-# STAGE 2: INTEGRATE TO DATABASE AND PUSH
-# ==============================================================================
 integrate_and_push:
   stage: integrate
   needs:
@@ -196,25 +35,45 @@ integrate_and_push:
     - git config --global http.sslcainfo "${SSL_CERT_FILE_PATH}"
     - git remote set-url origin https://alesher:${PAT_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git
     
-    # Pull latest changes ONCE
-    - echo "⬇️  Pulling latest changes"
-    - git pull origin $CI_COMMIT_REF_NAME --rebase || true
+    # Fetch latest but don't merge yet
+    - echo "⬇️  Fetching latest changes"
+    - git fetch origin $CI_COMMIT_REF_NAME
+    
+    # Check if we're behind
+    - |
+      BEHIND=$(git rev-list --count HEAD..origin/$CI_COMMIT_REF_NAME)
+      if [ "$BEHIND" -gt 0 ]; then
+        echo "⚠️  Branch is $BEHIND commit(s) behind origin"
+        echo "🔄 Resetting to origin state"
+        git reset --hard origin/$CI_COMMIT_REF_NAME
+      else
+        echo "✅ Branch is up to date with origin"
+      fi
     
     # ============================================================================
     # PART 1: Update Database with NEW Baseline Rules
     # ============================================================================
     - |
       if [ -d "$BASELINE_DIR" ]; then
-        # Get list of NEW rules (created in this pipeline run)
-        NEW_RULES=$(git diff --name-only HEAD "$BASELINE_DIR" | grep -E '\.(yar|yara|rule)$' || echo "")
+        # Find newly added baseline rules (files in artifacts that don't exist in repo yet)
+        NEW_RULES=""
+        
+        for file in "$BASELINE_DIR"/*; do
+          [ -f "$file" ] || continue
+          
+          # Check if this file is new (not in the current git tree)
+          if ! git ls-files --error-unmatch "$file" >/dev/null 2>&1; then
+            NEW_RULES="$NEW_RULES $file"
+          fi
+        done
         
         if [ -n "$NEW_RULES" ]; then
-          NEW_COUNT=$(echo "$NEW_RULES" | wc -l)
+          NEW_COUNT=$(echo "$NEW_RULES" | wc -w)
           echo "📊 Updating database with $NEW_COUNT new baseline rule(s)..."
           
           # Create temp directory with only new rules
           TEMP_DIR=$(mktemp -d)
-          echo "$NEW_RULES" | while read -r rule_path; do
+          for rule_path in $NEW_RULES; do
             if [ -f "$rule_path" ]; then
               cp "$rule_path" "$TEMP_DIR/"
             fi
@@ -320,7 +179,7 @@ integrate_and_push:
       VALIDATED_COUNT=0
       REJECTED_COUNT=0
       
-      [ -d "$BASELINE_DIR" ] && VALIDATED_COUNT=$(git diff --cached --name-only --diff-filter=A "$BASELINE_DIR" | wc -l)
+      [ -d "$BASELINE_DIR" ] && VALIDATED_COUNT=$(git diff --cached --name-only --diff-filter=A "$BASELINE_DIR" | grep -E '\.(yar|yara|rule)$' | wc -l)
       [ -d "$REJECTED_DIR" ] && REJECTED_COUNT=$(find "$REJECTED_DIR" -type f \( -name "*.yar" -o -name "*.yara" -o -name "*.rule" \) 2>/dev/null | wc -l)
       
       git commit -m "CI: Process YARA rules - Validated: ${VALIDATED_COUNT}, Rejected: ${REJECTED_COUNT} [skip ci]"
