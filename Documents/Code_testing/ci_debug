@@ -1,27 +1,67 @@
 # ============================================================================
-# DEBUG JOB - Remove after testing
+# YARA Rule Validation Pipeline - DEBUG VERSION
+# ============================================================================
+
+variables:
+  PYTHON_IMAGE: "python:3.9"
+  NEW_RULES_DIR: "New_Rules"
+  BASELINE_DIR: "Baseline_Rules"
+  REJECTED_DIR: "Rejected_Rules"
+  DATABASE_PATH: "database/yara_rules.db"
+  REPORTS_DIR: "reports"
+  TEMP_DIR: "temp"
+
+stages:
+  - test
+
+# ============================================================================
+# Workflow Rules - Run on everything
+# ============================================================================
+workflow:
+  rules:
+    - when: always
+
+# ============================================================================
+# DEBUG JOB
 # ============================================================================
 debug_check:
-  stage: check_baseline
+  stage: test
   image: $PYTHON_IMAGE
   tags:
-    - yara-validation
+    - yara-validation  # ← REPLACE WITH YOUR ACTUAL TAG
   script:
-    - echo "🔍 Debugging directory structure..."
+    - echo "============================================"
+    - echo "🔍 DEBUG: Pipeline is running!"
+    - echo "============================================"
+    - echo ""
     - echo "Current directory:"
     - pwd
     - echo ""
-    - echo "Directory listing:"
+    - echo "============================================"
+    - echo "📁 Directory listing (root):"
+    - echo "============================================"
     - ls -la
     - echo ""
-    - echo "Looking for New_Rules directory:"
-    - ls -la New_Rules/ || echo "New_Rules directory not found!"
+    - echo "============================================"
+    - echo "🔍 Looking for New_Rules directory:"
+    - echo "============================================"
+    - ls -la New_Rules/ || echo "❌ New_Rules directory not found!"
     - echo ""
-    - echo "Looking for YARA files:"
-    - find . -name "*.yar" -o -name "*.yara" -o -name "*.rule" || echo "No YARA files found"
+    - echo "============================================"
+    - echo "🔍 Looking for all directories:"
+    - echo "============================================"
+    - find . -maxdepth 2 -type d
     - echo ""
-    - echo "Git status:"
+    - echo "============================================"
+    - echo "📄 Looking for YARA files:"
+    - echo "============================================"
+    - find . -type f \( -name "*.yar" -o -name "*.yara" -o -name "*.rule" \) || echo "❌ No YARA files found"
+    - echo ""
+    - echo "============================================"
+    - echo "📊 Git status:"
+    - echo "============================================"
     - git status
-  rules:
-    - if: '$CI_PIPELINE_SOURCE == "push"'
-    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - echo ""
+    - echo "============================================"
+    - echo "✅ DEBUG JOB COMPLETED"
+    - echo "============================================"
