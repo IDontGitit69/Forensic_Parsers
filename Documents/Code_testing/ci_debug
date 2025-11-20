@@ -1,0 +1,27 @@
+# ============================================================================
+# DEBUG JOB - Remove after testing
+# ============================================================================
+debug_check:
+  stage: check_baseline
+  image: $PYTHON_IMAGE
+  tags:
+    - yara-validation
+  script:
+    - echo "🔍 Debugging directory structure..."
+    - echo "Current directory:"
+    - pwd
+    - echo ""
+    - echo "Directory listing:"
+    - ls -la
+    - echo ""
+    - echo "Looking for New_Rules directory:"
+    - ls -la New_Rules/ || echo "New_Rules directory not found!"
+    - echo ""
+    - echo "Looking for YARA files:"
+    - find . -name "*.yar" -o -name "*.yara" -o -name "*.rule" || echo "No YARA files found"
+    - echo ""
+    - echo "Git status:"
+    - git status
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
