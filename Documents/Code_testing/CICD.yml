@@ -364,156 +364,128 @@ commit_changes:
   tags:
     - yaralyzer
   variables:
-    GIT_STRATEGY: clone  # ← Fresh clone for git operations
+    GIT_STRATEGY: clone  # Fresh clone
   needs:
     - job: generate_report
       artifacts: true
   script:
     - echo "🧹 Stage 7: Cleaning up and committing changes"
     
+    # Install git if not present
+    - apt-get update -qq && apt-get install -y -qq git sqlite3
+    
     # Configure Git
+    - echo "🔧 Configuring Git..."
     - git config --global user.email "${user_email}"
     - git config --global user.name "${user_name}"
     - git config --global http.sslCAInfo "${SSL_CERT_FILE_PATH}"
     - git remote set-url origin https://alesher:${PAT_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git
     
-    # Fetch latest
+    # Show what we have in artifacts BEFORE any git operations
+    - echo "📦 Artifacts received from previous job:"
+    - ls -la "$BASELINE_DIR/" 2>/dev/null || echo "No baseline rules"
+    - ls -la "$REJECTED_DIR/" 2>/dev/null || echo "No rejected rules"
+    - ls -lh "$DATABASE_PATH" 2>/dev/null || echo "No database"
+    - echo "Database row count from artifact:"
+    - sqlite3 "$DATABASE_PATH" "SELECT COUNT(*) FROM rules;" 2>/dev/null || echo "Could not query"
+    
+    # Create a temporary directory to save artifacts
+    - echo "💾 Backing up artifacts to temp location..."
+    - mkdir -p /tmp/artifacts_backup
+    - |
+      # Backup all artifacts to temp location BEFORE git reset
+      if [ -d "$BASELINE_DIR" ]; then
+        mkdir -p /tmp/artifacts_backup/baseline
+        cp -r "$BASELINE_DIR"/* /tmp/artifacts_backup/baseline/ 2>/dev/null || true
+      fi
+      
+      if [ -d "$REJECTED_DIR" ]; then
+        mkdir -p /tmp/artifacts_backup/rejected
+        cp -r "$REJECTED_DIR"/* /tmp/artifacts_backup/rejected/ 2>/dev/null || true
+      fi
+      
+      if [ -d "$REPORTS_DIR" ]; then
+        mkdir -p /tmp/artifacts_backup/reports
+        cp -r "$REPORTS_DIR"/* /tmp/artifacts_backup/reports/ 2>/dev/null || true
+      fi
+      
+      if [ -f "$DATABASE_PATH" ]; then
+        mkdir -p /tmp/artifacts_backup/database
+        cp "$DATABASE_PATH" /tmp/artifacts_backup/database/yara_rules.db
+      fi
+      
+      if [ -f "$YARA_ROOT/validation_report.json" ]; then
+        mkdir -p /tmp/artifacts_backup/reports
+        cp "$YARA_ROOT/validation_report.json" /tmp/artifacts_backup/reports/
+      fi
+      
+      if [ -f "$YARA_ROOT/validation_report.md" ]; then
+        mkdir -p /tmp/artifacts_backup/reports
+        cp "$YARA_ROOT/validation_report.md" /tmp/artifacts_backup/reports/
+      fi
+    
+    - echo "✅ Artifacts backed up to /tmp/artifacts_backup"
+    - ls -la /tmp/artifacts_backup/
+    
+    # Now sync with remote repository
+    - echo "⬇️  Syncing with remote repository..."
     - git fetch origin $CI_COMMIT_REF_NAME
     - git reset --hard origin/$CI_COMMIT_REF_NAME
     
-    # Show database state from artifacts
-    - echo "📊 Database from artifacts:"
-    - ls -lh "$DATABASE_PATH"
+    # Restore artifacts from backup INTO the git working directory
+    - echo "📦 Restoring artifacts from backup to git working directory..."
     - |
-      if command -v sqlite3 >/dev/null 2>&1; then
-        echo "Row count in artifact database:"
+      # Restore baseline rules
+      if [ -d /tmp/artifacts_backup/baseline ] && [ -n "$(ls -A /tmp/artifacts_backup/baseline 2>/dev/null)" ]; then
+        echo "Restoring baseline rules..."
+        mkdir -p "$BASELINE_DIR"
+        cp -v /tmp/artifacts_backup/baseline/* "$BASELINE_DIR/"
+      fi
+      
+      # Restore rejected rules
+      if [ -d /tmp/artifacts_backup/rejected ] && [ -n "$(ls -A /tmp/artifacts_backup/rejected 2>/dev/null)" ]; then
+        echo "Restoring rejected rules..."
+        mkdir -p "$REJECTED_DIR"
+        cp -v /tmp/artifacts_backup/rejected/* "$REJECTED_DIR/"
+      fi
+      
+      # Restore reports
+      if [ -d /tmp/artifacts_backup/reports ] && [ -n "$(ls -A /tmp/artifacts_backup/reports 2>/dev/null)" ]; then
+        echo "Restoring reports..."
+        mkdir -p "$REPORTS_DIR"
+        cp -v /tmp/artifacts_backup/reports/* "$REPORTS_DIR/" 2>/dev/null || true
+        
+        # Restore master reports
+        if [ -f /tmp/artifacts_backup/reports/validation_report.json ]; then
+          cp -v /tmp/artifacts_backup/reports/validation_report.json "$YARA_ROOT/"
+        fi
+        if [ -f /tmp/artifacts_backup/reports/validation_report.md ]; then
+          cp -v /tmp/artifacts_backup/reports/validation_report.md "$YARA_ROOT/"
+        fi
+      fi
+      
+      # CRITICAL: Restore updated database
+      if [ -f /tmp/artifacts_backup/database/yara_rules.db ]; then
+        echo "Restoring UPDATED database..."
+        mkdir -p "$(dirname "$DATABASE_PATH")"
+        cp -v /tmp/artifacts_backup/database/yara_rules.db "$DATABASE_PATH"
+        echo "Database restored - checking row count:"
         sqlite3 "$DATABASE_PATH" "SELECT COUNT(*) FROM rules;" 2>/dev/null || echo "Could not query"
       fi
     
-    # Copy artifacts to working directory (OVERWRITE old versions)
-    - echo "📦 Copying updated files from artifacts..."
-    - |
-      # Copy validated rules to baseline
-      if [ -d "$BASELINE_DIR" ] && [ -n "$(ls -A "$BASELINE_DIR" 2>/dev/null)" ]; then
-        echo "Copying baseline rules..."
-        cp -vf "$BASELINE_DIR"/* "$BASELINE_DIR/" 2>/dev/null || true
-      fi
-      
-      # Copy rejected rules
-      if [ -d "$REJECTED_DIR" ] && [ -n "$(ls -A "$REJECTED_DIR" 2>/dev/null)" ]; then
-        echo "Copying rejected rules..."
-        mkdir -p "$REJECTED_DIR"
-        cp -vf "$REJECTED_DIR"/* "$REJECTED_DIR/" 2>/dev/null || true
-      fi
-      
-      # Copy reports
-      if [ -d "$REPORTS_DIR" ] && [ -n "$(ls -A "$REPORTS_DIR" 2>/dev/null)" ]; then
-        echo "Copying reports..."
-        mkdir -p "$REPORTS_DIR"
-        cp -vf "$REPORTS_DIR"/* "$REPORTS_DIR/" 2>/dev/null || true
-      fi
-      
-      # Copy master reports
-      if [ -f "$YARA_ROOT/validation_report.json" ]; then
-        cp -vf "$YARA_ROOT/validation_report.json" "$YARA_ROOT/"
-      fi
-      if [ -f "$YARA_ROOT/validation_report.md" ]; then
-        cp -vf "$YARA_ROOT/validation_report.md" "$YARA_ROOT/"
-      fi
-      
-      # CRITICAL: Copy updated database
-      if [ -f "$DATABASE_PATH" ]; then
-        echo "Copying UPDATED database..."
-        mkdir -p "$(dirname "$DATABASE_PATH")"
-        cp -vf "$DATABASE_PATH" "$DATABASE_PATH"
-      fi
+    - echo "✅ Artifacts restored to working directory"
     
-    # Show database state after copy
-    - echo "📊 Database after copy to working directory:"
-    - ls -lh "$DATABASE_PATH"
-    
-    # Remove processed rules from New_Rules
+    # Remove processed rules from New_Rules directory
     - echo "🗑️  Removing processed rules from $NEW_RULES_DIR..."
     - |
       REMOVED_COUNT=0
-      for file in "$NEW_RULES_DIR"/*.yar "$NEW_RULES_DIR"/*.yara "$NEW_RULES_DIR"/*.rule; do
-        if [ -f "$file" ]; then
-          echo "  Removing: $(basename "$file")"
-          git rm -f "$file" 2>/dev/null || rm -f "$file"
-          REMOVED_COUNT=$((REMOVED_COUNT + 1))
-        fi
-      done
-      echo "Removed $REMOVED_COUNT file(s)"
-    
-    # Stage all changes
-    - echo "📝 Staging changes..."
-    - git add "$BASELINE_DIR/" 2>/dev/null || true
-    - git add "$REJECTED_DIR/" 2>/dev/null || true
-    - git add "$DATABASE_PATH" 2>/dev/null || true
-    - git add "$REPORTS_DIR/" 2>/dev/null || true
-    - git add "$YARA_ROOT/validation_report.json" 2>/dev/null || true
-    - git add "$YARA_ROOT/validation_report.md" 2>/dev/null || true
-    - git add "$NEW_RULES_DIR/" 2>/dev/null || true
-    
-    # Show what's being committed
-    - echo "📋 Changes to commit:"
-    - git status --short
-    - git diff --cached --stat
-    
-    # Commit and push
-    - |
-      if ! git diff --cached --quiet; then
-        ADDED=$(find "$BASELINE_DIR" -type f 2>/dev/null | wc -l)
-        REJECTED=$(find "$REJECTED_DIR" -type f 2>/dev/null | wc -l)
-        
-        if [ "$ADDED" -gt 0 ] && [ "$REJECTED" -gt 0 ]; then
-          MSG="CI: Processed YARA rules - Added: ${ADDED}, Rejected: ${REJECTED} [skip ci]"
-        elif [ "$ADDED" -gt 0 ]; then
-          MSG="CI: Successfully added ${ADDED} YARA rule(s) [skip ci]"
-        elif [ "$REJECTED" -gt 0 ]; then
-          MSG="CI: Rejected ${REJECTED} YARA rule(s) [skip ci]"
-        else
-          MSG="CI: Processed YARA rules [skip ci]"
-        fi
-        
-        echo "💬 Commit message: $MSG"
-        git commit -m "$MSG"
-        
-        echo "📤 Pushing to repository..."
-        git push origin HEAD:${CI_COMMIT_REF_NAME}
-        
-        echo "✅ Successfully pushed changes"
-      else
-        echo "ℹ️  No changes to commit"
+      if [ -d "$NEW_RULES_DIR" ]; then
+        for file in "$NEW_RULES_DIR"/*.yar "$NEW_RULES_DIR"/*.yara "$NEW_RULES_DIR"/*.rule; do
+          if [ -f "$file" ]; then
+            echo "  Removing: $(basename "$file")"
+            git rm -f "$file" 2>/dev/null || rm -f "$file"
+            REMOVED_COUNT=$((REMOVED_COUNT + 1))
+          fi
+        done
       fi
-    
-    - echo ""
-    - echo "================================================================================"
-    - echo "✅ PIPELINE COMPLETED"
-    - echo "================================================================================"
-```
-
----
-
-## 🎯 Key Fixes:
-
-### **1. Fixed Artifact Paths**
-- Early stages only save `$TEMP_DIR`, `$REPORTS_DIR`, `$REJECTED_DIR`
-- **NOT** saving `$YARA_ROOT` or database until `integrate` stage
-- This prevents old database from overwriting new one
-
-### **2. Database Update Flow**
-```
-integrate job:
-  - GIT_STRATEGY: clone ← Get fresh database from repo
-  - Update database ✅
-  - Save as artifact
-
-generate_report job:
-  - Receives updated database from integrate
-  - Saves in artifacts
-
-commit_changes job:
-  - GIT_STRATEGY: clone ← Get fresh repo
-  - Copy database FROM ARTIFACTS
-  - Commit updated database ✅
+      echo "🗑️  Removed $REMOVED_COUNT file(s) from $NEW_RULES_DIR"
