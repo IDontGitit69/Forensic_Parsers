@@ -4,19 +4,18 @@
 
 variables:
   PYTHON_IMAGE: "python:3.9"
-  NEW_RULES_DIR: "New_Rules"
-  BASELINE_DIR: "Baseline_Rules"
-  REJECTED_DIR: "Rejected_Rules"
-  DATABASE_PATH: "database/yara_rules.db"
-  REPORTS_DIR: "reports"
-  TEMP_DIR: "temp"
+  YARA_ROOT: "Yara Rules"
+  NEW_RULES_DIR: "Yara Rules/New_Rules"
+  BASELINE_DIR: "Yara Rules/Baseline_Rules"
+  REJECTED_DIR: "Yara Rules/Rejected_Rules"
+  DATABASE_PATH: "Yara Rules/database/yara_rules.db"
+  REPORTS_DIR: "Yara Rules/reports"
+  TEMP_DIR: "Yara Rules/temp"
+  TOOLS_DIR: "Yara Rules/Tools"
 
 stages:
   - test
 
-# ============================================================================
-# Workflow Rules - Run on everything
-# ============================================================================
 workflow:
   rules:
     - when: always
@@ -28,39 +27,44 @@ debug_check:
   stage: test
   image: $PYTHON_IMAGE
   tags:
-    - yara-validation  # ← REPLACE WITH YOUR ACTUAL TAG
+    - yara-validation
   script:
     - echo "============================================"
-    - echo "🔍 DEBUG: Pipeline is running!"
+    - echo "🔍 DEBUG: Testing Directory Structure"
     - echo "============================================"
     - echo ""
     - echo "Current directory:"
     - pwd
     - echo ""
     - echo "============================================"
-    - echo "📁 Directory listing (root):"
+    - echo "📁 Root directory listing:"
     - echo "============================================"
     - ls -la
     - echo ""
     - echo "============================================"
-    - echo "🔍 Looking for New_Rules directory:"
+    - echo "📁 Yara Rules directory:"
     - echo "============================================"
-    - ls -la New_Rules/ || echo "❌ New_Rules directory not found!"
+    - ls -la "Yara Rules/" || echo "❌ Yara Rules directory not found!"
     - echo ""
     - echo "============================================"
-    - echo "🔍 Looking for all directories:"
+    - echo "📁 New_Rules directory:"
     - echo "============================================"
-    - find . -maxdepth 2 -type d
+    - ls -la "$NEW_RULES_DIR" || echo "❌ New_Rules directory not found!"
     - echo ""
     - echo "============================================"
-    - echo "📄 Looking for YARA files:"
+    - echo "📁 Tools directory:"
     - echo "============================================"
-    - find . -type f \( -name "*.yar" -o -name "*.yara" -o -name "*.rule" \) || echo "❌ No YARA files found"
+    - ls -la "$TOOLS_DIR" || echo "❌ Tools directory not found!"
     - echo ""
     - echo "============================================"
-    - echo "📊 Git status:"
+    - echo "📁 Database path:"
     - echo "============================================"
-    - git status
+    - ls -la "$DATABASE_PATH" || echo "❌ Database not found!"
+    - echo ""
+    - echo "============================================"
+    - echo "📄 Looking for YARA files in New_Rules:"
+    - echo "============================================"
+    - find "$NEW_RULES_DIR" -type f \( -name "*.yar" -o -name "*.yara" -o -name "*.rule" \) 2>/dev/null || echo "❌ No YARA files found"
     - echo ""
     - echo "============================================"
     - echo "✅ DEBUG JOB COMPLETED"
