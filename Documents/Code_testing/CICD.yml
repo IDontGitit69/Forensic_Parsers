@@ -66,7 +66,6 @@ baseline_check:
       
       if [ "$RULE_COUNT" -eq 0 ]; then
         echo "ℹ️  No YARA rules found in $NEW_RULES_DIR"
-        # Create empty marker files so subsequent jobs can detect this
         mkdir -p "$TEMP_DIR"
         touch "$TEMP_DIR/no_rules_found"
         exit 0
@@ -87,22 +86,17 @@ baseline_check:
       if [ -d "$TEMP_DIR/new_rules" ]; then
         NEW_COUNT=$(find "$TEMP_DIR/new_rules" -type f 2>/dev/null | wc -l)
         echo "  - New rules: $NEW_COUNT"
-      else
-        echo "  - New rules: 0"
       fi
-      
       if [ -d "$TEMP_DIR/already_in_baseline" ]; then
         EXISTING_COUNT=$(find "$TEMP_DIR/already_in_baseline" -type f 2>/dev/null | wc -l)
         echo "  - Already in baseline: $EXISTING_COUNT"
-      else
-        echo "  - Already in baseline: 0"
       fi
   
   artifacts:
     paths:
-      - "$TEMP_DIR/"
-      - "$REPORTS_DIR/"
-      - "$YARA_ROOT/"
+      - "$TEMP_DIR/"          # ← Only temp files
+      - "$REPORTS_DIR/"       # ← Only reports
+      # NOT including database or baseline directory
     expire_in: 1 week
 
 # ============================================================================
@@ -126,7 +120,7 @@ validate_syntax:
       fi
       
       if [ ! -d "$TEMP_DIR/new_rules" ] || [ -z "$(ls -A "$TEMP_DIR/new_rules" 2>/dev/null)" ]; then
-        echo "ℹ️  No new rules to validate (all already in baseline)"
+        echo "ℹ️  No new rules to validate"
         mkdir -p "$TEMP_DIR"
         touch "$TEMP_DIR/no_new_rules"
         exit 0
@@ -141,7 +135,6 @@ validate_syntax:
         --json-report "$REPORTS_DIR/syntax_validation.json" \
         --verbose
     
-    # Check results
     - |
       if [ -d "$TEMP_DIR/syntax_valid" ]; then
         VALID_COUNT=$(find "$TEMP_DIR/syntax_valid" -type f 2>/dev/null | wc -l)
@@ -152,10 +145,9 @@ validate_syntax:
   
   artifacts:
     paths:
-      - "$TEMP_DIR/"
-      - "$REJECTED_DIR/"
-      - "$REPORTS_DIR/"
-      - "$YARA_ROOT/"
+      - "$TEMP_DIR/"          # ← Temp files with validated rules
+      - "$REJECTED_DIR/"      # ← Rejected rules
+      - "$REPORTS_DIR/"       # ← Reports
     expire_in: 1 week
 
 # ============================================================================
@@ -171,15 +163,14 @@ validate_metadata:
   script:
     - echo "📋 Stage 3: Validating metadata"
     
-    # Check if we have rules to validate
     - |
       if [ -f "$TEMP_DIR/no_rules_found" ] || [ -f "$TEMP_DIR/no_new_rules" ]; then
-        echo "ℹ️  No rules to validate (marker file found)"
+        echo "ℹ️  No rules to validate"
         exit 0
       fi
       
       if [ ! -d "$TEMP_DIR/syntax_valid" ] || [ -z "$(ls -A "$TEMP_DIR/syntax_valid" 2>/dev/null)" ]; then
-        echo "ℹ️  No rules to validate (none passed syntax check)"
+        echo "ℹ️  No rules passed syntax check"
         mkdir -p "$TEMP_DIR"
         touch "$TEMP_DIR/no_syntax_valid"
         exit 0
@@ -191,13 +182,10 @@ validate_metadata:
         --json-report "$REPORTS_DIR/metadata_validation.json" \
         --verbose
     
-    # Check results
     - |
       if [ -d "$TEMP_DIR/syntax_valid" ]; then
         VALID_COUNT=$(find "$TEMP_DIR/syntax_valid" -type f 2>/dev/null | wc -l)
         echo "✅ $VALID_COUNT rule(s) passed metadata validation"
-      else
-        echo "❌ No rules passed metadata validation"
       fi
   
   artifacts:
@@ -205,7 +193,6 @@ validate_metadata:
       - "$TEMP_DIR/"
       - "$REJECTED_DIR/"
       - "$REPORTS_DIR/"
-      - "$YARA_ROOT/"
     expire_in: 1 week
 
 # ============================================================================
@@ -221,15 +208,14 @@ deduplicate:
   script:
     - echo "🔄 Stage 4: Deduplicating rules"
     
-    # Check if we have rules to deduplicate
     - |
       if [ -f "$TEMP_DIR/no_rules_found" ] || [ -f "$TEMP_DIR/no_new_rules" ] || [ -f "$TEMP_DIR/no_syntax_valid" ]; then
-        echo "ℹ️  No rules to deduplicate (marker file found)"
+        echo "ℹ️  No rules to deduplicate"
         exit 0
       fi
       
       if [ ! -d "$TEMP_DIR/syntax_valid" ] || [ -z "$(ls -A "$TEMP_DIR/syntax_valid" 2>/dev/null)" ]; then
-        echo "ℹ️  No rules to deduplicate (none passed metadata check)"
+        echo "ℹ️  No rules passed metadata check"
         mkdir -p "$TEMP_DIR"
         touch "$TEMP_DIR/no_metadata_valid"
         exit 0
@@ -241,13 +227,10 @@ deduplicate:
         --json-report "$REPORTS_DIR/deduplication.json" \
         --verbose
     
-    # Check results
     - |
       if [ -d "$TEMP_DIR/deduplicated" ]; then
         DEDUP_COUNT=$(find "$TEMP_DIR/deduplicated" -type f 2>/dev/null | wc -l)
         echo "✅ $DEDUP_COUNT rule(s) after deduplication"
-      else
-        echo "❌ No rules remain after deduplication"
       fi
   
   artifacts:
@@ -255,7 +238,6 @@ deduplicate:
       - "$TEMP_DIR/"
       - "$REJECTED_DIR/"
       - "$REPORTS_DIR/"
-      - "$YARA_ROOT/"
     expire_in: 1 week
 
 # ============================================================================
@@ -264,6 +246,8 @@ deduplicate:
 integrate:
   stage: integrate
   image: $PYTHON_IMAGE
+  variables:
+    GIT_STRATEGY: clone  # ← IMPORTANT: Need fresh database from repo
   <<: *python_setup
   needs:
     - job: deduplicate
@@ -281,20 +265,29 @@ integrate:
       fi
       
       if [ -f "$TEMP_DIR/no_new_rules" ]; then
-        echo "ℹ️  All rules already in baseline - no database update needed"
+        echo "ℹ️  All rules already in baseline"
         mkdir -p "$REPORTS_DIR"
-        echo '{"timestamp":"'$(date -Iseconds)'","statistics":{"total_added":0,"total_skipped":0},"added_rules":[],"skipped_rules":[],"note":"all rules already in baseline"}' > "$REPORTS_DIR/database_update.json"
+        echo '{"timestamp":"'$(date -Iseconds)'","statistics":{"total_added":0,"total_skipped":0},"added_rules":[],"skipped_rules":[]}' > "$REPORTS_DIR/database_update.json"
         exit 0
       fi
       
       if [ ! -d "$TEMP_DIR/deduplicated" ] || [ -z "$(ls -A "$TEMP_DIR/deduplicated" 2>/dev/null)" ]; then
-        echo "ℹ️  No validated rules to add to database"
+        echo "ℹ️  No validated rules to add"
         mkdir -p "$REPORTS_DIR"
-        echo '{"timestamp":"'$(date -Iseconds)'","statistics":{"total_added":0,"total_skipped":0},"added_rules":[],"skipped_rules":[],"note":"no rules passed validation"}' > "$REPORTS_DIR/database_update.json"
+        echo '{"timestamp":"'$(date -Iseconds)'","statistics":{"total_added":0,"total_skipped":0},"added_rules":[],"skipped_rules":[]}' > "$REPORTS_DIR/database_update.json"
         exit 0
       fi
     
-    # We have rules to process!
+    # Show database state BEFORE update
+    - echo "📊 Database state BEFORE update:"
+    - ls -lh "$DATABASE_PATH"
+    - |
+      if command -v sqlite3 >/dev/null 2>&1; then
+        echo "Database row count:"
+        sqlite3 "$DATABASE_PATH" "SELECT COUNT(*) FROM rules;" 2>/dev/null || echo "Could not query database"
+      fi
+    
+    # Update database
     - echo "📊 Updating baseline database..."
     - |
       python3 "$TOOLS_DIR/update_database.py" "$TEMP_DIR/deduplicated" \
@@ -302,7 +295,17 @@ integrate:
         --json-report "$REPORTS_DIR/database_update.json" \
         --verbose
     
-    - echo "📁 Moving validated rules to baseline..."
+    # Show database state AFTER update
+    - echo "📊 Database state AFTER update:"
+    - ls -lh "$DATABASE_PATH"
+    - |
+      if command -v sqlite3 >/dev/null 2>&1; then
+        echo "Database row count:"
+        sqlite3 "$DATABASE_PATH" "SELECT COUNT(*) FROM rules;" 2>/dev/null || echo "Could not query database"
+      fi
+    
+    # Copy validated rules to baseline
+    - echo "📁 Preparing validated rules for baseline..."
     - mkdir -p "$BASELINE_DIR"
     - cp -v "$TEMP_DIR/deduplicated"/* "$BASELINE_DIR/"
     
@@ -310,11 +313,10 @@ integrate:
   
   artifacts:
     paths:
-      - "$BASELINE_DIR/"
-      - "$REJECTED_DIR/"
-      - "$REPORTS_DIR/"
-      - "$DATABASE_PATH"
-      - "$YARA_ROOT/"
+      - "$BASELINE_DIR/"      # ← NEW rules for baseline
+      - "$REJECTED_DIR/"      # ← Rejected rules
+      - "$REPORTS_DIR/"       # ← All reports
+      - "$DATABASE_PATH"      # ← UPDATED database (CRITICAL!)
     expire_in: 1 week
 
 # ============================================================================
@@ -341,16 +343,16 @@ generate_report:
         --output-markdown "$YARA_ROOT/validation_report.md"
     
     - echo "✅ Reports generated"
+    - echo "📄 Report location: $YARA_ROOT/validation_report.md"
   
   artifacts:
     paths:
-      - "$YARA_ROOT/validation_report.json"
+      - "$YARA_ROOT/validation_report.json"   # ← Master reports
       - "$YARA_ROOT/validation_report.md"
-      - "$REPORTS_DIR/"
-      - "$BASELINE_DIR/"
-      - "$REJECTED_DIR/"
-      - "$DATABASE_PATH"
-      - "$YARA_ROOT/"
+      - "$REPORTS_DIR/"                       # ← Individual reports
+      - "$BASELINE_DIR/"                      # ← New baseline rules
+      - "$REJECTED_DIR/"                      # ← Rejected rules
+      - "$DATABASE_PATH"                      # ← Updated database
     expire_in: 1 week
 
 # ============================================================================
@@ -362,7 +364,7 @@ commit_changes:
   tags:
     - yaralyzer
   variables:
-    GIT_STRATEGY: clone
+    GIT_STRATEGY: clone  # ← Fresh clone for git operations
   needs:
     - job: generate_report
       artifacts: true
@@ -375,9 +377,60 @@ commit_changes:
     - git config --global http.sslCAInfo "${SSL_CERT_FILE_PATH}"
     - git remote set-url origin https://alesher:${PAT_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git
     
-    # Sync with remote
+    # Fetch latest
     - git fetch origin $CI_COMMIT_REF_NAME
     - git reset --hard origin/$CI_COMMIT_REF_NAME
+    
+    # Show database state from artifacts
+    - echo "📊 Database from artifacts:"
+    - ls -lh "$DATABASE_PATH"
+    - |
+      if command -v sqlite3 >/dev/null 2>&1; then
+        echo "Row count in artifact database:"
+        sqlite3 "$DATABASE_PATH" "SELECT COUNT(*) FROM rules;" 2>/dev/null || echo "Could not query"
+      fi
+    
+    # Copy artifacts to working directory (OVERWRITE old versions)
+    - echo "📦 Copying updated files from artifacts..."
+    - |
+      # Copy validated rules to baseline
+      if [ -d "$BASELINE_DIR" ] && [ -n "$(ls -A "$BASELINE_DIR" 2>/dev/null)" ]; then
+        echo "Copying baseline rules..."
+        cp -vf "$BASELINE_DIR"/* "$BASELINE_DIR/" 2>/dev/null || true
+      fi
+      
+      # Copy rejected rules
+      if [ -d "$REJECTED_DIR" ] && [ -n "$(ls -A "$REJECTED_DIR" 2>/dev/null)" ]; then
+        echo "Copying rejected rules..."
+        mkdir -p "$REJECTED_DIR"
+        cp -vf "$REJECTED_DIR"/* "$REJECTED_DIR/" 2>/dev/null || true
+      fi
+      
+      # Copy reports
+      if [ -d "$REPORTS_DIR" ] && [ -n "$(ls -A "$REPORTS_DIR" 2>/dev/null)" ]; then
+        echo "Copying reports..."
+        mkdir -p "$REPORTS_DIR"
+        cp -vf "$REPORTS_DIR"/* "$REPORTS_DIR/" 2>/dev/null || true
+      fi
+      
+      # Copy master reports
+      if [ -f "$YARA_ROOT/validation_report.json" ]; then
+        cp -vf "$YARA_ROOT/validation_report.json" "$YARA_ROOT/"
+      fi
+      if [ -f "$YARA_ROOT/validation_report.md" ]; then
+        cp -vf "$YARA_ROOT/validation_report.md" "$YARA_ROOT/"
+      fi
+      
+      # CRITICAL: Copy updated database
+      if [ -f "$DATABASE_PATH" ]; then
+        echo "Copying UPDATED database..."
+        mkdir -p "$(dirname "$DATABASE_PATH")"
+        cp -vf "$DATABASE_PATH" "$DATABASE_PATH"
+      fi
+    
+    # Show database state after copy
+    - echo "📊 Database after copy to working directory:"
+    - ls -lh "$DATABASE_PATH"
     
     # Remove processed rules from New_Rules
     - echo "🗑️  Removing processed rules from $NEW_RULES_DIR..."
@@ -393,9 +446,21 @@ commit_changes:
       echo "Removed $REMOVED_COUNT file(s)"
     
     # Stage all changes
-    - git add "$BASELINE_DIR/" "$REJECTED_DIR/" "$DATABASE_PATH" "$REPORTS_DIR/" "$YARA_ROOT/validation_report"* "$NEW_RULES_DIR/" 2>/dev/null || true
+    - echo "📝 Staging changes..."
+    - git add "$BASELINE_DIR/" 2>/dev/null || true
+    - git add "$REJECTED_DIR/" 2>/dev/null || true
+    - git add "$DATABASE_PATH" 2>/dev/null || true
+    - git add "$REPORTS_DIR/" 2>/dev/null || true
+    - git add "$YARA_ROOT/validation_report.json" 2>/dev/null || true
+    - git add "$YARA_ROOT/validation_report.md" 2>/dev/null || true
+    - git add "$NEW_RULES_DIR/" 2>/dev/null || true
     
-    # Commit
+    # Show what's being committed
+    - echo "📋 Changes to commit:"
+    - git status --short
+    - git diff --cached --stat
+    
+    # Commit and push
     - |
       if ! git diff --cached --quiet; then
         ADDED=$(find "$BASELINE_DIR" -type f 2>/dev/null | wc -l)
@@ -411,9 +476,44 @@ commit_changes:
           MSG="CI: Processed YARA rules [skip ci]"
         fi
         
+        echo "💬 Commit message: $MSG"
         git commit -m "$MSG"
+        
+        echo "📤 Pushing to repository..."
         git push origin HEAD:${CI_COMMIT_REF_NAME}
-        echo "✅ Changes pushed"
+        
+        echo "✅ Successfully pushed changes"
       else
         echo "ℹ️  No changes to commit"
       fi
+    
+    - echo ""
+    - echo "================================================================================"
+    - echo "✅ PIPELINE COMPLETED"
+    - echo "================================================================================"
+```
+
+---
+
+## 🎯 Key Fixes:
+
+### **1. Fixed Artifact Paths**
+- Early stages only save `$TEMP_DIR`, `$REPORTS_DIR`, `$REJECTED_DIR`
+- **NOT** saving `$YARA_ROOT` or database until `integrate` stage
+- This prevents old database from overwriting new one
+
+### **2. Database Update Flow**
+```
+integrate job:
+  - GIT_STRATEGY: clone ← Get fresh database from repo
+  - Update database ✅
+  - Save as artifact
+
+generate_report job:
+  - Receives updated database from integrate
+  - Saves in artifacts
+
+commit_changes job:
+  - GIT_STRATEGY: clone ← Get fresh repo
+  - Copy database FROM ARTIFACTS
+  - Commit updated database ✅
