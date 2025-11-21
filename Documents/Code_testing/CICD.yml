@@ -12,7 +12,7 @@ variables:
   REPORTS_DIR: "Yara Rules/reports"
   TEMP_DIR: "Yara Rules/temp"
   TOOLS_DIR: "Yara Rules/Tools"
-  GIT_STRATEGY: none  # ← CRITICAL: Don't re-clone the repo for each job
+  GIT_STRATEGY: none
 
 stages:
   - check_baseline
@@ -24,20 +24,15 @@ stages:
   - cleanup
 
 # ============================================================================
-# Workflow Rules - Only run on NEW files added (not removals)
+# Workflow Rules
 # ============================================================================
 workflow:
   rules:
-    # Only trigger on push when files are ADDED to New_Rules (not removed)
     - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_MESSAGE !~ /\[skip ci\]/'
       changes:
         - "Yara Rules/New_Rules/**/*"
-      when: always
-    # Manual triggers
     - if: '$CI_PIPELINE_SOURCE == "web"'
-      when: always
     - if: '$CI_PIPELINE_SOURCE == "api"'
-      when: always
 
 # ============================================================================
 # Reusable Configuration
@@ -52,13 +47,13 @@ workflow:
     - echo "✅ Python environment ready"
 
 # ============================================================================
-# STAGE 1: Baseline Check (Filter existing rules)
+# STAGE 1: Baseline Check
 # ============================================================================
 baseline_check:
   stage: check_baseline
   image: $PYTHON_IMAGE
   variables:
-    GIT_STRATEGY: clone  # ← Only this first job needs to clone
+    GIT_STRATEGY: clone
   <<: *python_setup
   script:
     - echo "🔍 Stage 1: Checking rules against baseline database"
@@ -67,16 +62,14 @@ baseline_check:
     # Check if there are any rules to process
     - |
       RULE_COUNT=$(find "$NEW_RULES_DIR" -type f \( -name "*.yar" -o -name "*.yara" -o -name "*.rule" \) 2>/dev/null | wc -l)
+      echo "Found $RULE_COUNT rule file(s)"
+      
       if [ "$RULE_COUNT" -eq 0 ]; then
         echo "ℹ️  No YARA rules found in $NEW_RULES_DIR"
-        echo "SKIP_PIPELINE=true" > pipeline.env
-        echo "HAS_NEW_RULES=false" >> pipeline.env
-        echo "HAS_EXISTING_RULES=false" >> pipeline.env
-        echo "EXISTING_COUNT=0" >> pipeline.env
+        # Create empty marker files so subsequent jobs can detect this
+        mkdir -p "$TEMP_DIR"
+        touch "$TEMP_DIR/no_rules_found"
         exit 0
-      else
-        echo "📋 Found $RULE_COUNT rule file(s) to process"
-        echo "SKIP_PIPELINE=false" > pipeline.env
       fi
     
     # Run baseline check
@@ -88,41 +81,28 @@ baseline_check:
         --json-report "$REPORTS_DIR/baseline_check.json" \
         --verbose
     
-    # Check if we have any NEW rules to validate
+    # Check results
     - |
-      if [ -d "$TEMP_DIR/new_rules" ] && [ -n "$(ls -A "$TEMP_DIR/new_rules" 2>/dev/null)" ]; then
-        NEW_COUNT=$(find "$TEMP_DIR/new_rules" -type f | wc -l)
-        echo "✅ Found $NEW_COUNT new rule(s) - proceeding to validation"
-        echo "HAS_NEW_RULES=true" >> pipeline.env
+      echo "📊 Baseline check results:"
+      if [ -d "$TEMP_DIR/new_rules" ]; then
+        NEW_COUNT=$(find "$TEMP_DIR/new_rules" -type f 2>/dev/null | wc -l)
+        echo "  - New rules: $NEW_COUNT"
       else
-        echo "ℹ️  No new rules to validate (all already in baseline)"
-        echo "HAS_NEW_RULES=false" >> pipeline.env
+        echo "  - New rules: 0"
       fi
-    
-    # Check if we have rules that are already in baseline
-    - |
-      if [ -d "$TEMP_DIR/already_in_baseline" ] && [ -n "$(ls -A "$TEMP_DIR/already_in_baseline" 2>/dev/null)" ]; then
-        EXISTING_COUNT=$(find "$TEMP_DIR/already_in_baseline" -type f | wc -l)
-        echo "⏭️  Found $EXISTING_COUNT rule(s) already in baseline"
-        echo "HAS_EXISTING_RULES=true" >> pipeline.env
-        echo "EXISTING_COUNT=$EXISTING_COUNT" >> pipeline.env
+      
+      if [ -d "$TEMP_DIR/already_in_baseline" ]; then
+        EXISTING_COUNT=$(find "$TEMP_DIR/already_in_baseline" -type f 2>/dev/null | wc -l)
+        echo "  - Already in baseline: $EXISTING_COUNT"
       else
-        echo "HAS_EXISTING_RULES=false" >> pipeline.env
-        echo "EXISTING_COUNT=0" >> pipeline.env
+        echo "  - Already in baseline: 0"
       fi
-    
-    # Show what we captured
-    - echo "📋 Pipeline environment variables:"
-    - cat pipeline.env
   
   artifacts:
     paths:
       - "$TEMP_DIR/"
       - "$REPORTS_DIR/"
-      - "$YARA_ROOT/"  # ← Include entire Yara Rules directory
-      - pipeline.env  # ← Explicit path
-    reports:
-      dotenv: pipeline.env
+      - "$YARA_ROOT/"
     expire_in: 1 week
 
 # ============================================================================
@@ -135,14 +115,23 @@ validate_syntax:
   needs:
     - job: baseline_check
       artifacts: true
-  rules:
-    - if: $HAS_NEW_RULES == "true"
-      when: on_success
-    - when: never
   script:
     - echo "✅ Stage 2: Validating YARA syntax"
-    - echo "📋 Current environment:"
-    - cat pipeline.env || echo "⚠️  pipeline.env not found"
+    
+    # Check if we have new rules to validate
+    - |
+      if [ -f "$TEMP_DIR/no_rules_found" ]; then
+        echo "ℹ️  No rules to validate (marker file found)"
+        exit 0
+      fi
+      
+      if [ ! -d "$TEMP_DIR/new_rules" ] || [ -z "$(ls -A "$TEMP_DIR/new_rules" 2>/dev/null)" ]; then
+        echo "ℹ️  No new rules to validate (all already in baseline)"
+        mkdir -p "$TEMP_DIR"
+        touch "$TEMP_DIR/no_new_rules"
+        exit 0
+      fi
+    
     - mkdir -p "$REJECTED_DIR"
     
     - |
@@ -152,19 +141,14 @@ validate_syntax:
         --json-report "$REPORTS_DIR/syntax_validation.json" \
         --verbose
     
-    # Check if we have any valid rules after syntax check
+    # Check results
     - |
-      if [ -d "$TEMP_DIR/syntax_valid" ] && [ -n "$(ls -A "$TEMP_DIR/syntax_valid" 2>/dev/null)" ]; then
-        VALID_COUNT=$(find "$TEMP_DIR/syntax_valid" -type f | wc -l)
+      if [ -d "$TEMP_DIR/syntax_valid" ]; then
+        VALID_COUNT=$(find "$TEMP_DIR/syntax_valid" -type f 2>/dev/null | wc -l)
         echo "✅ $VALID_COUNT rule(s) passed syntax validation"
-        echo "HAS_SYNTAX_VALID=true" >> pipeline.env
       else
         echo "❌ No rules passed syntax validation"
-        echo "HAS_SYNTAX_VALID=false" >> pipeline.env
       fi
-    
-    - echo "📋 Updated environment:"
-    - cat pipeline.env
   
   artifacts:
     paths:
@@ -172,9 +156,6 @@ validate_syntax:
       - "$REJECTED_DIR/"
       - "$REPORTS_DIR/"
       - "$YARA_ROOT/"
-      - pipeline.env
-    reports:
-      dotenv: pipeline.env
     expire_in: 1 week
 
 # ============================================================================
@@ -187,14 +168,22 @@ validate_metadata:
   needs:
     - job: validate_syntax
       artifacts: true
-  rules:
-    - if: $HAS_SYNTAX_VALID == "true"
-      when: on_success
-    - when: never
   script:
     - echo "📋 Stage 3: Validating metadata"
-    - echo "📋 Current environment:"
-    - cat pipeline.env || echo "⚠️  pipeline.env not found"
+    
+    # Check if we have rules to validate
+    - |
+      if [ -f "$TEMP_DIR/no_rules_found" ] || [ -f "$TEMP_DIR/no_new_rules" ]; then
+        echo "ℹ️  No rules to validate (marker file found)"
+        exit 0
+      fi
+      
+      if [ ! -d "$TEMP_DIR/syntax_valid" ] || [ -z "$(ls -A "$TEMP_DIR/syntax_valid" 2>/dev/null)" ]; then
+        echo "ℹ️  No rules to validate (none passed syntax check)"
+        mkdir -p "$TEMP_DIR"
+        touch "$TEMP_DIR/no_syntax_valid"
+        exit 0
+      fi
     
     - |
       python3 "$TOOLS_DIR/validate_metadata.py" "$TEMP_DIR/syntax_valid" \
@@ -202,19 +191,14 @@ validate_metadata:
         --json-report "$REPORTS_DIR/metadata_validation.json" \
         --verbose
     
-    # Re-check what's still in syntax_valid (metadata check removes invalid files)
+    # Check results
     - |
-      if [ -d "$TEMP_DIR/syntax_valid" ] && [ -n "$(ls -A "$TEMP_DIR/syntax_valid" 2>/dev/null)" ]; then
-        VALID_COUNT=$(find "$TEMP_DIR/syntax_valid" -type f | wc -l)
+      if [ -d "$TEMP_DIR/syntax_valid" ]; then
+        VALID_COUNT=$(find "$TEMP_DIR/syntax_valid" -type f 2>/dev/null | wc -l)
         echo "✅ $VALID_COUNT rule(s) passed metadata validation"
-        echo "HAS_METADATA_VALID=true" >> pipeline.env
       else
         echo "❌ No rules passed metadata validation"
-        echo "HAS_METADATA_VALID=false" >> pipeline.env
       fi
-    
-    - echo "📋 Updated environment:"
-    - cat pipeline.env
   
   artifacts:
     paths:
@@ -222,9 +206,6 @@ validate_metadata:
       - "$REJECTED_DIR/"
       - "$REPORTS_DIR/"
       - "$YARA_ROOT/"
-      - pipeline.env
-    reports:
-      dotenv: pipeline.env
     expire_in: 1 week
 
 # ============================================================================
@@ -237,14 +218,22 @@ deduplicate:
   needs:
     - job: validate_metadata
       artifacts: true
-  rules:
-    - if: $HAS_METADATA_VALID == "true"
-      when: on_success
-    - when: never
   script:
     - echo "🔄 Stage 4: Deduplicating rules"
-    - echo "📋 Current environment:"
-    - cat pipeline.env || echo "⚠️  pipeline.env not found"
+    
+    # Check if we have rules to deduplicate
+    - |
+      if [ -f "$TEMP_DIR/no_rules_found" ] || [ -f "$TEMP_DIR/no_new_rules" ] || [ -f "$TEMP_DIR/no_syntax_valid" ]; then
+        echo "ℹ️  No rules to deduplicate (marker file found)"
+        exit 0
+      fi
+      
+      if [ ! -d "$TEMP_DIR/syntax_valid" ] || [ -z "$(ls -A "$TEMP_DIR/syntax_valid" 2>/dev/null)" ]; then
+        echo "ℹ️  No rules to deduplicate (none passed metadata check)"
+        mkdir -p "$TEMP_DIR"
+        touch "$TEMP_DIR/no_metadata_valid"
+        exit 0
+      fi
     
     - |
       python3 "$TOOLS_DIR/deduplicate_rules.py" "$TEMP_DIR/syntax_valid" \
@@ -252,21 +241,14 @@ deduplicate:
         --json-report "$REPORTS_DIR/deduplication.json" \
         --verbose
     
-    # Check if we have rules after deduplication
+    # Check results
     - |
-      if [ -d "$TEMP_DIR/deduplicated" ] && [ -n "$(ls -A "$TEMP_DIR/deduplicated" 2>/dev/null)" ]; then
-        DEDUP_COUNT=$(find "$TEMP_DIR/deduplicated" -type f | wc -l)
+      if [ -d "$TEMP_DIR/deduplicated" ]; then
+        DEDUP_COUNT=$(find "$TEMP_DIR/deduplicated" -type f 2>/dev/null | wc -l)
         echo "✅ $DEDUP_COUNT rule(s) after deduplication"
-        echo "HAS_DEDUPLICATED=true" >> pipeline.env
-        echo "FINAL_VALID_COUNT=$DEDUP_COUNT" >> pipeline.env
       else
         echo "❌ No rules remain after deduplication"
-        echo "HAS_DEDUPLICATED=false" >> pipeline.env
-        echo "FINAL_VALID_COUNT=0" >> pipeline.env
       fi
-    
-    - echo "📋 Updated environment:"
-    - cat pipeline.env
   
   artifacts:
     paths:
@@ -274,9 +256,6 @@ deduplicate:
       - "$REJECTED_DIR/"
       - "$REPORTS_DIR/"
       - "$YARA_ROOT/"
-      - pipeline.env
-    reports:
-      dotenv: pipeline.env
     expire_in: 1 week
 
 # ============================================================================
@@ -287,46 +266,47 @@ integrate:
   image: $PYTHON_IMAGE
   <<: *python_setup
   needs:
-    - job: baseline_check
-      artifacts: true
     - job: deduplicate
       artifacts: true
-      optional: true
-  rules:
-    - when: on_success
   script:
     - echo "💾 Stage 5: Updating database and integrating rules"
-    - echo "📋 Current environment:"
-    - cat pipeline.env || echo "⚠️  pipeline.env not found - using defaults"
     
-    # Source environment if it exists
+    # Check if we have rules to integrate
     - |
-      if [ -f pipeline.env ]; then
-        source pipeline.env
-      fi
-    
-    # Set defaults if not set
-    - |
-      HAS_DEDUPLICATED=${HAS_DEDUPLICATED:-false}
-      FINAL_VALID_COUNT=${FINAL_VALID_COUNT:-0}
-    
-    # Update database if we have validated rules
-    - |
-      if [ "$HAS_DEDUPLICATED" = "true" ]; then
-        echo "📊 Updating baseline database..."
-        python3 "$TOOLS_DIR/update_database.py" "$TEMP_DIR/deduplicated" \
-          --database "$DATABASE_PATH" \
-          --json-report "$REPORTS_DIR/database_update.json" \
-          --verbose
-        
-        echo "📁 Moving validated rules to baseline..."
-        mkdir -p "$BASELINE_DIR"
-        cp -v "$TEMP_DIR/deduplicated"/* "$BASELINE_DIR/" || echo "No files to copy"
-      else
-        echo "ℹ️  No rules to add to database"
+      if [ -f "$TEMP_DIR/no_rules_found" ]; then
+        echo "ℹ️  No rules to integrate"
         mkdir -p "$REPORTS_DIR"
         echo '{"timestamp":"'$(date -Iseconds)'","statistics":{"total_added":0,"total_skipped":0},"added_rules":[],"skipped_rules":[]}' > "$REPORTS_DIR/database_update.json"
+        exit 0
       fi
+      
+      if [ -f "$TEMP_DIR/no_new_rules" ]; then
+        echo "ℹ️  All rules already in baseline - no database update needed"
+        mkdir -p "$REPORTS_DIR"
+        echo '{"timestamp":"'$(date -Iseconds)'","statistics":{"total_added":0,"total_skipped":0},"added_rules":[],"skipped_rules":[],"note":"all rules already in baseline"}' > "$REPORTS_DIR/database_update.json"
+        exit 0
+      fi
+      
+      if [ ! -d "$TEMP_DIR/deduplicated" ] || [ -z "$(ls -A "$TEMP_DIR/deduplicated" 2>/dev/null)" ]; then
+        echo "ℹ️  No validated rules to add to database"
+        mkdir -p "$REPORTS_DIR"
+        echo '{"timestamp":"'$(date -Iseconds)'","statistics":{"total_added":0,"total_skipped":0},"added_rules":[],"skipped_rules":[],"note":"no rules passed validation"}' > "$REPORTS_DIR/database_update.json"
+        exit 0
+      fi
+    
+    # We have rules to process!
+    - echo "📊 Updating baseline database..."
+    - |
+      python3 "$TOOLS_DIR/update_database.py" "$TEMP_DIR/deduplicated" \
+        --database "$DATABASE_PATH" \
+        --json-report "$REPORTS_DIR/database_update.json" \
+        --verbose
+    
+    - echo "📁 Moving validated rules to baseline..."
+    - mkdir -p "$BASELINE_DIR"
+    - cp -v "$TEMP_DIR/deduplicated"/* "$BASELINE_DIR/"
+    
+    - echo "✅ Integration complete"
   
   artifacts:
     paths:
@@ -335,13 +315,10 @@ integrate:
       - "$REPORTS_DIR/"
       - "$DATABASE_PATH"
       - "$YARA_ROOT/"
-      - pipeline.env
-    reports:
-      dotenv: pipeline.env
     expire_in: 1 week
 
 # ============================================================================
-# STAGE 6: Generate Comprehensive Report
+# STAGE 6: Generate Report
 # ============================================================================
 generate_report:
   stage: report
@@ -350,8 +327,6 @@ generate_report:
   needs:
     - job: integrate
       artifacts: true
-  rules:
-    - when: on_success
   script:
     - echo "📊 Stage 6: Generating comprehensive validation report"
     
@@ -365,11 +340,7 @@ generate_report:
         --output-json "$YARA_ROOT/validation_report.json" \
         --output-markdown "$YARA_ROOT/validation_report.md"
     
-    - echo "✅ Reports generated successfully"
-    - echo ""
-    - echo "📄 Master Reports:"
-    - echo "  - $YARA_ROOT/validation_report.json"
-    - echo "  - $YARA_ROOT/validation_report.md"
+    - echo "✅ Reports generated"
   
   artifacts:
     paths:
@@ -380,7 +351,6 @@ generate_report:
       - "$REJECTED_DIR/"
       - "$DATABASE_PATH"
       - "$YARA_ROOT/"
-      - pipeline.env
     expire_in: 1 week
 
 # ============================================================================
@@ -392,131 +362,58 @@ commit_changes:
   tags:
     - yaralyzer
   variables:
-    GIT_STRATEGY: clone  # ← Need fresh clone for git operations
+    GIT_STRATEGY: clone
   needs:
     - job: generate_report
       artifacts: true
-  rules:
-    - when: on_success
   script:
     - echo "🧹 Stage 7: Cleaning up and committing changes"
     
-    # Source environment variables
-    - |
-      if [ -f pipeline.env ]; then
-        echo "📋 Loading environment:"
-        cat pipeline.env
-        source pipeline.env
-      fi
-    
     # Configure Git
-    - echo "🔧 Configuring Git..."
     - git config --global user.email "${user_email}"
     - git config --global user.name "${user_name}"
     - git config --global http.sslCAInfo "${SSL_CERT_FILE_PATH}"
     - git remote set-url origin https://alesher:${PAT_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git
     
-    # Fetch and reset to latest
-    - echo "⬇️  Syncing with remote..."
+    # Sync with remote
     - git fetch origin $CI_COMMIT_REF_NAME
     - git reset --hard origin/$CI_COMMIT_REF_NAME
     
-    # Copy artifacts back into the working directory
-    - echo "📦 Restoring artifacts..."
-    - |
-      if [ -d "$BASELINE_DIR" ]; then
-        mkdir -p "$BASELINE_DIR"
-        find "$BASELINE_DIR" -type f -name "*.yar" -o -name "*.yara" -o -name "*.rule" 2>/dev/null || true
-      fi
-      
-      if [ -d "$REJECTED_DIR" ]; then
-        mkdir -p "$REJECTED_DIR"
-        find "$REJECTED_DIR" -type f -name "*.yar" -o -name "*.yara" -o -name "*.rule" 2>/dev/null || true
-      fi
-    
-    # Remove processed rules from New_Rules directory
+    # Remove processed rules from New_Rules
     - echo "🗑️  Removing processed rules from $NEW_RULES_DIR..."
     - |
       REMOVED_COUNT=0
-      if [ -d "$NEW_RULES_DIR" ]; then
-        for file in "$NEW_RULES_DIR"/*.yar "$NEW_RULES_DIR"/*.yara "$NEW_RULES_DIR"/*.rule; do
-          if [ -f "$file" ]; then
-            echo "  Removing: $(basename "$file")"
-            git rm -f "$file" 2>/dev/null || rm -f "$file"
-            REMOVED_COUNT=$((REMOVED_COUNT + 1))
-          fi
-        done
-      fi
-      echo "🗑️  Removed $REMOVED_COUNT file(s) from $NEW_RULES_DIR"
+      for file in "$NEW_RULES_DIR"/*.yar "$NEW_RULES_DIR"/*.yara "$NEW_RULES_DIR"/*.rule; do
+        if [ -f "$file" ]; then
+          echo "  Removing: $(basename "$file")"
+          git rm -f "$file" 2>/dev/null || rm -f "$file"
+          REMOVED_COUNT=$((REMOVED_COUNT + 1))
+        fi
+      done
+      echo "Removed $REMOVED_COUNT file(s)"
     
     # Stage all changes
-    - echo "📝 Staging changes..."
-    - git add "$BASELINE_DIR/" || true
-    - git add "$REJECTED_DIR/" || true
-    - git add "$DATABASE_PATH" || true
-    - git add "$REPORTS_DIR/" || true
-    - git add "$YARA_ROOT/validation_report.json" || true
-    - git add "$YARA_ROOT/validation_report.md" || true
-    - git add "$NEW_RULES_DIR/" || true
+    - git add "$BASELINE_DIR/" "$REJECTED_DIR/" "$DATABASE_PATH" "$REPORTS_DIR/" "$YARA_ROOT/validation_report"* "$NEW_RULES_DIR/" 2>/dev/null || true
     
-    # Show what we're committing
-    - echo "📋 Changes to commit:"
-    - git status --short
-    
-    # Create commit message
+    # Commit
     - |
-      ADDED_COUNT=${FINAL_VALID_COUNT:-0}
-      EXISTING=${EXISTING_COUNT:-0}
-      
-      # Count rejected files
-      REJECTED_COUNT=0
-      if [ -d "$REJECTED_DIR" ]; then
-        REJECTED_COUNT=$(find "$REJECTED_DIR" -type f \( -name "*.yar" -o -name "*.yara" -o -name "*.rule" \) 2>/dev/null | wc -l)
-      fi
-      
-      # Build commit message
-      if [ "$ADDED_COUNT" -gt 0 ] && [ "$REJECTED_COUNT" -gt 0 ]; then
-        COMMIT_MSG="CI: Processed YARA rules - Added: ${ADDED_COUNT}, Rejected: ${REJECTED_COUNT}"
-      elif [ "$ADDED_COUNT" -gt 0 ]; then
-        COMMIT_MSG="CI: Successfully added ${ADDED_COUNT} YARA rule(s)"
-      elif [ "$REJECTED_COUNT" -gt 0 ]; then
-        COMMIT_MSG="CI: Rejected ${REJECTED_COUNT} YARA rule(s)"
-      elif [ "$EXISTING" -gt 0 ]; then
-        COMMIT_MSG="CI: All ${EXISTING} rule(s) already in baseline"
-      else
-        COMMIT_MSG="CI: Processed YARA rules"
-      fi
-      
-      # Add skip ci flag to prevent infinite loop
-      COMMIT_MSG="${COMMIT_MSG} [skip ci]"
-      
-      echo "💬 Commit message: $COMMIT_MSG"
-    
-    # Commit if there are changes
-    - |
-      if git diff --cached --quiet; then
-        echo "ℹ️  No changes to commit"
-      else
-        echo "💾 Creating commit..."
-        git commit -m "$COMMIT_MSG"
+      if ! git diff --cached --quiet; then
+        ADDED=$(find "$BASELINE_DIR" -type f 2>/dev/null | wc -l)
+        REJECTED=$(find "$REJECTED_DIR" -type f 2>/dev/null | wc -l)
         
-        echo "📤 Pushing changes to repository..."
+        if [ "$ADDED" -gt 0 ] && [ "$REJECTED" -gt 0 ]; then
+          MSG="CI: Processed YARA rules - Added: ${ADDED}, Rejected: ${REJECTED} [skip ci]"
+        elif [ "$ADDED" -gt 0 ]; then
+          MSG="CI: Successfully added ${ADDED} YARA rule(s) [skip ci]"
+        elif [ "$REJECTED" -gt 0 ]; then
+          MSG="CI: Rejected ${REJECTED} YARA rule(s) [skip ci]"
+        else
+          MSG="CI: Processed YARA rules [skip ci]"
+        fi
+        
+        git commit -m "$MSG"
         git push origin HEAD:${CI_COMMIT_REF_NAME}
-        
-        echo "✅ Successfully pushed changes to ${CI_COMMIT_REF_NAME}"
+        echo "✅ Changes pushed"
+      else
+        echo "ℹ️  No changes to commit"
       fi
-    
-    - echo ""
-    - echo "================================================================================"
-    - echo "✅ PIPELINE COMPLETED SUCCESSFULLY"
-    - echo "================================================================================"
-    - |
-      echo "📊 Summary:"
-      echo "  - Rules Added: ${FINAL_VALID_COUNT:-0}"
-      echo "  - Rules Rejected: ${REJECTED_COUNT:-0}"
-      echo "  - Already in Baseline: ${EXISTING_COUNT:-0}"
-      echo ""
-      echo "📄 View comprehensive report: $YARA_ROOT/validation_report.md"
-      echo "================================================================================"
-  
-  allow_failure: false
