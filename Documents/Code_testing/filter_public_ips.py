@@ -32,33 +32,35 @@ def is_public_ip(ip_str):
 def filter_public_ips(input_file, output_file):
     """
     Read IPs from input CSV, filter for public IPs, write to output CSV.
+    Preserves all columns from the input file.
     """
-    public_ips = []
+    public_ip_rows = []
+    fieldnames = None
     
     try:
         with open(input_file, 'r', newline='', encoding='utf-8') as infile:
             reader = csv.DictReader(infile)
+            fieldnames = reader.fieldnames
             
             # Verify 'ip' column exists
-            if 'ip' not in reader.fieldnames:
+            if 'ip' not in fieldnames:
                 print(f"Error: 'ip' column not found in {input_file}")
-                print(f"Available columns: {reader.fieldnames}")
+                print(f"Available columns: {fieldnames}")
                 sys.exit(1)
             
-            # Filter for public IPs
+            # Filter for public IPs, keeping entire row
             for row in reader:
                 ip = row['ip']
                 if is_public_ip(ip):
-                    public_ips.append(ip)
+                    public_ip_rows.append(row)
         
-        # Write filtered IPs to output file
+        # Write filtered rows to output file
         with open(output_file, 'w', newline='', encoding='utf-8') as outfile:
-            writer = csv.writer(outfile)
-            writer.writerow(['ip'])  # Write header
-            for ip in public_ips:
-                writer.writerow([ip])
+            writer = csv.DictWriter(outfile, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(public_ip_rows)
         
-        print(f"Filtered {len(public_ips)} public IP addresses")
+        print(f"Filtered {len(public_ip_rows)} public IP addresses")
         print(f"Output written to: {output_file}")
         
     except FileNotFoundError:
