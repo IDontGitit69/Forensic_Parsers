@@ -161,11 +161,13 @@ def process_yara_file(input_path, output_path):
     # Process each rule
     modified_rules = []
     modified_count = 0
+    has_memonly_rules = False
     
     for rule_info in rules:
         rule_name = extract_rule_name(rule_info['text'])
         
         if has_memonly_in_name(rule_name):
+            has_memonly_rules = True
             modified_rule, was_modified = add_scope_to_meta(rule_info['text'], "memory")
             modified_rules.append(modified_rule)
             
@@ -177,6 +179,10 @@ def process_yara_file(input_path, output_path):
         else:
             # No memonly in name, keep rule as-is
             modified_rules.append(rule_info['text'])
+    
+    # Only write to output if at least one rule had memonly
+    if not has_memonly_rules:
+        return True, 0  # Success but no modifications
     
     # Reconstruct the file
     output_content = header + '\n'.join(modified_rules)
@@ -259,10 +265,9 @@ This will process all .yar files and add scope="memory" to rules with "memonly" 
             
             if modified_count > 0:
                 print(f"  → Modified {modified_count} rule(s) in this file")
+                print(f"  ✓ Saved to: {output_file}\n")
             else:
-                print(f"  → No rules with 'memonly' found in this file")
-            
-            print(f"  ✓ Saved to: {output_file}\n")
+                print(f"  → No rules with 'memonly' found - skipping output\n")
         else:
             print(f"  ✗ Failed to process {yar_file.name}\n")
     
