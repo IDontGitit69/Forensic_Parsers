@@ -1,5 +1,3 @@
- - echo "Rules in database:" $(sqlite3 "$DATABASE_PATH" "SELECT COUNT(*) FROM rules;" 2>/dev/null || echo "0")
-
 # ============================================================================
 # YARA Rule Validation Pipeline - SIMPLIFIED
 # ============================================================================
@@ -44,9 +42,8 @@ validate_and_integrate:
     - echo "================================================================================"
     
     # Install dependencies
-    - apt-get update -qq && apt-get install -y -qq git sqlite3
-    - pip3 install --quiet --break-system-packages yara-python 2>/dev/null || pip3 install --quiet yara-python
-    
+
+    - source "/mnt/h/Detection Repo/gitlab-venvs/yara-env/bin/activate"    
     # Create directories
     - mkdir -p "$REPORTS_DIR" "$TEMP_DIR" "$REJECTED_DIR"
     
