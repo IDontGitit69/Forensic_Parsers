@@ -1,6 +1,6 @@
 jq '.[] 
     | select(."winEventLog.id" == 4688) 
-    | select(."winEventLog"."description" | ascii_downcase | contains("zsatunnel")) 
+    | select((."winEventLog"."description" // "") | ascii_downcase | contains("zsatunnel")) 
     | {
         Time: ."winEventLog"."TimeCreated"."SystemTime",
         Creator: ."winEventLog"."EventData"."CreatorProcessName",
