@@ -18,7 +18,7 @@ echo "============================================" | tee -a "$LOG_FILE"
 
 # Find all snapshot descriptor VMDKs (excludes -flat.vmdk extents)
 # Matches patterns like: disk-000001.vmdk, vm-000002.vmdk, etc.
-VMDKS=($(ls *-00000*.vmdk 2>/dev/null | grep -v '\-flat\.vmdk'))
+VMDKS=($(find . -maxdepth 1 -name "*00000*.vmdk" ! -name "*-flat.vmdk" | sort))
 
 if [ ${#VMDKS[@]} -eq 0 ]; then
     echo "[ERROR] No snapshot VMDK descriptor files found in current directory." | tee -a "$LOG_FILE"
