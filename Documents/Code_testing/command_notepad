@@ -1,1 +1,2 @@
 sudo find /mnt/vmfs -exec stat --format="%n|%i|%a|%u|%g|%s|%X|%Y|%Z|%W" {} \; > /path/to/full_metadata.txt
+sudo find /mnt/vmfs -printf "%T+ %A+ %C+ %n %U %G %s %p\n" > /path/to/timestamps_backup.txt
