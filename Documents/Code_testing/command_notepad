@@ -1,2 +1,16 @@
 sudo find /mnt/vmfs -exec stat --format="%n|%i|%a|%u|%g|%s|%X|%Y|%Z|%W" {} \; > /path/to/full_metadata.txt
 sudo find /mnt/vmfs -printf "%T+ %A+ %C+ %n %U %G %s %p\n" > /path/to/timestamps_backup.txt
+
+jq -r '
+  select(.reasons != null) |
+  .file as $file |
+  .reasons[]? |
+  select(.name != null) |
+  [.name, $file]
+' thor_scan.json | \
+jq -rs '
+  group_by(.[0]) |
+  .[] |
+  "Rule: " + .[0][0] + "\n" +
+  (to_entries | map("  " + (.key + 1 | tostring) + ". " + .value[1]) | join("\n"))
+'
