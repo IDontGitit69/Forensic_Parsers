@@ -1,17 +1,42 @@
-sudo find /mnt/vmfs -exec stat --format="%n|%i|%a|%u|%g|%s|%X|%Y|%Z|%W" {} \; > /path/to/full_metadata.txt
-sudo find /mnt/vmfs -printf "%T+ %A+ %C+ %n %U %G %s %p\n" > /path/to/timestamps_backup.txt
+import struct
+import hashlib
 
-jq -rs '
-  [ .[] |
-    select(.module == "Filescan") |
-    select(.reasons != null) |
-    .file.path as $filepath |
-    .reasons[]? |
-    select(.name != null) |
-    {reason: .name, file: $filepath}
-  ] |
-  group_by(.reason) |
-  .[] |
-  "\nRule: " + .[0].reason + "\n" +
-  (to_entries | map("  " + (.key + 1 | tostring) + ". " + .value.file) | join("\n"))
-' thor_scan.json
+with open('/path/to/dropbear_key', 'rb') as f:
+    data = f.read()
+
+offset = 0
+
+# Read key type string
+key_type_len = struct.unpack('>I', data[offset:offset+4])[0]
+offset += 4
+key_type = data[offset:offset+key_type_len].decode('utf-8')
+offset += key_type_len
+print(f"Key type: {key_type}")
+
+# Read public key bytes
+pub_key_len = struct.unpack('>I', data[offset:offset+4])[0]
+offset += 4
+pub_key_bytes = data[offset:offset+pub_key_len]
+offset += pub_key_len
+print(f"Public key length: {pub_key_len} bytes")
+print(f"Public key hex: {pub_key_bytes.hex()}")
+
+# Reconstruct the SSH wire format public key blob
+# (this is what gets hashed for the fingerprint)
+def encode_string(s):
+    if isinstance(s, str):
+        s = s.encode()
+    return struct.pack('>I', len(s)) + s
+
+wire_format = encode_string(key_type) + encode_string(pub_key_bytes)
+
+# MD5 fingerprint (Corelight/Zeek format)
+md5 = hashlib.md5(wire_format).digest()
+fingerprint = ':'.join(format(b, '02x') for b in md5)
+print(f"\nMD5 Fingerprint: {fingerprint}")
+
+# SHA256 fingerprint (bonus - modern format)
+import base64
+sha256 = hashlib.sha256(wire_format).digest()
+sha256_fp = base64.b64encode(sha256).decode().rstrip('=')
+print(f"SHA256 Fingerprint: SHA256:{sha256_fp}")
