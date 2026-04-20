@@ -130,3 +130,47 @@ Targets:
     FileMask: "vmware*.gz"
     Recursive: true
     IsDirectory: false
+
+
+
+- Name: ESXi rhttproxy log
+    Category: VMware ESXi
+    Path: \
+    FileMask: "rhttproxy*.log"
+    Recursive: true
+    IsDirectory: false
+
+  - Name: ESXi rhttproxy compressed logs
+    Category: VMware ESXi
+    Path: \
+    FileMask: "rhttproxy*.gz"
+    Recursive: true
+    IsDirectory: false
+
+  - Name: ESXi vmauthd log
+    Category: VMware ESXi
+    Path: \
+    FileMask: "vmauthd*.log"
+    Recursive: true
+    IsDirectory: false
+
+  - Name: ESXi vmauthd compressed logs
+    Category: VMware ESXic
+    Path: \
+    FileMask: "vmauthd*.gz"
+    Recursive: true
+    IsDirectory: false
+
+  - Name: ESXi envoy-access log
+    Category: VMware ESXi
+    Path: \
+    FileMask: "envoy-access*.log"
+    Recursive: true
+    IsDirectory: false
+
+  - Name: ESXi envoy-access compressed logs
+    Category: VMware ESXi
+    Path: \
+    FileMask: "envoy-access*.gz"
+    Recursive: true
+    IsDirectory: false
