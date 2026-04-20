@@ -1,42 +1,132 @@
-import struct
-import hashlib
+Name: ESXi_Logs_Flexible
+Description: Collects ESXi logs and compressed rotated logs from vm-support bundles or forensic images
+Author: YourName
+Version: 1.0
+Id: [your-guid-here]
+RecreateDirectories: true
+Targets:
+  - Name: ESXi hostd log
+    Category: VMware ESXi
+    Path: \
+    FileMask: "hostd*.log"
+    Recursive: true
+    IsDirectory: false
 
-with open('/path/to/dropbear_key', 'rb') as f:
-    data = f.read()
+  - Name: ESXi hostd compressed logs
+    Category: VMware ESXi
+    Path: \
+    FileMask: "hostd*.gz"
+    Recursive: true
+    IsDirectory: false
 
-offset = 0
+  - Name: ESXi vpxa log
+    Category: VMware ESXi
+    Path: \
+    FileMask: "vpxa*.log"
+    Recursive: true
+    IsDirectory: false
 
-# Read key type string
-key_type_len = struct.unpack('>I', data[offset:offset+4])[0]
-offset += 4
-key_type = data[offset:offset+key_type_len].decode('utf-8')
-offset += key_type_len
-print(f"Key type: {key_type}")
+  - Name: ESXi vpxa compressed logs
+    Category: VMware ESXi
+    Path: \
+    FileMask: "vpxa*.gz"
+    Recursive: true
+    IsDirectory: false
 
-# Read public key bytes
-pub_key_len = struct.unpack('>I', data[offset:offset+4])[0]
-offset += 4
-pub_key_bytes = data[offset:offset+pub_key_len]
-offset += pub_key_len
-print(f"Public key length: {pub_key_len} bytes")
-print(f"Public key hex: {pub_key_bytes.hex()}")
+  - Name: ESXi vmkernel log
+    Category: VMware ESXi
+    Path: \
+    FileMask: "vmkernel*.log"
+    Recursive: true
+    IsDirectory: false
 
-# Reconstruct the SSH wire format public key blob
-# (this is what gets hashed for the fingerprint)
-def encode_string(s):
-    if isinstance(s, str):
-        s = s.encode()
-    return struct.pack('>I', len(s)) + s
+  - Name: ESXi vmkernel compressed logs
+    Category: VMware ESXi
+    Path: \
+    FileMask: "vmkernel*.gz"
+    Recursive: true
+    IsDirectory: false
 
-wire_format = encode_string(key_type) + encode_string(pub_key_bytes)
+  - Name: ESXi auth log
+    Category: VMware ESXi
+    Path: \
+    FileMask: "auth.log"
+    Recursive: true
+    IsDirectory: false
 
-# MD5 fingerprint (Corelight/Zeek format)
-md5 = hashlib.md5(wire_format).digest()
-fingerprint = ':'.join(format(b, '02x') for b in md5)
-print(f"\nMD5 Fingerprint: {fingerprint}")
+  - Name: ESXi auth compressed logs
+    Category: VMware ESXi
+    Path: \
+    FileMask: "auth*.gz"
+    Recursive: true
+    IsDirectory: false
 
-# SHA256 fingerprint (bonus - modern format)
-import base64
-sha256 = hashlib.sha256(wire_format).digest()
-sha256_fp = base64.b64encode(sha256).decode().rstrip('=')
-print(f"SHA256 Fingerprint: SHA256:{sha256_fp}")
+  - Name: ESXi shell log
+    Category: VMware ESXi
+    Path: \
+    FileMask: "shell.log"
+    Recursive: true
+    IsDirectory: false
+
+  - Name: ESXi shell compressed logs
+    Category: VMware ESXi
+    Path: \
+    FileMask: "shell*.gz"
+    Recursive: true
+    IsDirectory: false
+
+  - Name: ESXi vobd log
+    Category: VMware ESXi
+    Path: \
+    FileMask: "vobd.log"
+    Recursive: true
+    IsDirectory: false
+
+  - Name: ESXi vobd compressed logs
+    Category: VMware ESXi
+    Path: \
+    FileMask: "vobd*.gz"
+    Recursive: true
+    IsDirectory: false
+
+  - Name: ESXi esxupdate log
+    Category: VMware ESXi
+    Path: \
+    FileMask: "esxupdate.log"
+    Recursive: true
+    IsDirectory: false
+
+  - Name: ESXi esxupdate compressed logs
+    Category: VMware ESXi
+    Path: \
+    FileMask: "esxupdate*.gz"
+    Recursive: true
+    IsDirectory: false
+
+  - Name: ESXi vmksummary log
+    Category: VMware ESXi
+    Path: \
+    FileMask: "vmksummary*.log"
+    Recursive: true
+    IsDirectory: false
+
+  - Name: ESXi vmksummary compressed logs
+    Category: VMware ESXi
+    Path: \
+    FileMask: "vmksummary*.gz"
+    Recursive: true
+    IsDirectory: false
+
+  - Name: Per-VM vmware logs
+    Category: VMware ESXi
+    Path: \
+    FileMask: "vmware.log"
+    Recursive: true
+    IsDirectory: false
+
+  - Name: Per-VM vmware compressed logs
+    Category: VMware ESXi
+    Path: \
+    FileMask: "vmware*.gz"
+    Recursive: true
+    IsDirectory: false
