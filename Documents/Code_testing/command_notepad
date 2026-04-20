@@ -2,7 +2,7 @@ Name: ESXi_Logs_Flexible
 Description: Collects ESXi logs and compressed rotated logs from vm-support bundles or forensic images
 Author: YourName
 Version: 1.0
-Id: [your-guid-here]
+Id: f47ac10b-58cc-4372-a567-0e02b2c3d479
 RecreateDirectories: true
 Targets:
   - Name: ESXi hostd log
