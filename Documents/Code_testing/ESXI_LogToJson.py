@@ -10,9 +10,9 @@ Usage: python ESXi_LogToJson.py <sourceDirectory> <destinationDirectory>
 - Outputs one JSON file per log source to the destination directory
 
 Each record contains three fields:
-    timestamp   - extracted from the start of the log line if present, else null
-    raw         - the full original log line
-    source_file - the filename the line came from
+    Timestamp  - ISO8601 timestamp extracted from the log line e.g. 2025-05-24T05:28:37.128455Z
+    TimeEpoch  - Unix epoch with microsecond precision e.g. 1748064517.128455
+    raw        - the full original log line
 """
 
 import os
@@ -20,6 +20,7 @@ import sys
 import gzip
 import json
 import re
+from datetime import datetime, timezone
 
 # ---------------------------------------------------------------------------
 # Known ESXi log filename prefixes - mirrors the .tkape FileMask entries
@@ -36,13 +37,17 @@ KNOWN_LOG_PREFIXES = [
     "rhttproxy",
     "vmauthd",
     "envoy-access",
-    "vmware",
+    "syslog",
+    "vmkwarning",
 ]
 
-# Matches the ISO8601-style timestamp ESXi puts at the start of every log line
-# e.g. 2024-01-15T12:34:56.789Z
+# Matches ISO8601-style timestamp at the start of every ESXi log line
+# Captures optional microseconds and optional Z suffix
+# e.g. 2025-05-24T05:28:37.128455Z
+#      2025-05-24T05:28:37.128Z
+#      2025-05-24T05:28:37Z
 TIMESTAMP_PATTERN = re.compile(
-    r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[\.\d]*Z?)"
+    r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.(\d+))?Z?)"
 )
 
 
@@ -73,15 +78,52 @@ def read_log_file(filepath: str) -> list:
     return [line.rstrip("\n") for line in lines]
 
 
-def extract_timestamp(line: str):
+def parse_timestamp(line: str):
     """
-    Pull the timestamp from the beginning of a log line.
-    Returns the timestamp string if found, None otherwise.
+    Extract the timestamp from the start of a log line and return both:
+      - Timestamp : normalized ISO8601 string with microseconds and Z suffix
+                    e.g. 2025-05-24T05:28:37.128455Z
+      - TimeEpoch : float Unix epoch with microsecond precision
+                    e.g. 1748064517.128455
+
+    Returns (None, None) if no timestamp is found.
     """
     m = TIMESTAMP_PATTERN.match(line)
-    if m:
-        return m.group(1)
-    return None
+    if not m:
+        return None, None
+
+    raw_ts = m.group(1)
+
+    # Normalize the fractional seconds to exactly 6 digits (microseconds)
+    # ESXi logs can have 3 (ms) or 6 (us) or other digit counts
+    frac_digits = m.group(2)  # fractional part without the dot, may be None
+
+    try:
+        if frac_digits:
+            # Pad or truncate to exactly 6 digits
+            frac_normalized = frac_digits.ljust(6, "0")[:6]
+            # Rebuild a clean datetime string for parsing
+            base_part = raw_ts.split(".")[0]  # everything before the dot
+            dt_str = f"{base_part}.{frac_normalized}"
+            dt = datetime.strptime(dt_str, "%Y-%m-%dT%H:%M:%S.%f")
+        else:
+            base_part = raw_ts.rstrip("Z")
+            dt = datetime.strptime(base_part, "%Y-%m-%dT%H:%M:%S")
+            frac_normalized = "000000"
+
+        # Attach UTC timezone
+        dt = dt.replace(tzinfo=timezone.utc)
+
+        # Build normalized Timestamp string
+        timestamp_str = dt.strftime("%Y-%m-%dT%H:%M:%S") + f".{frac_normalized}Z"
+
+        # Build TimeEpoch as float with microsecond precision
+        epoch = dt.timestamp()
+
+        return timestamp_str, round(epoch, 6)
+
+    except ValueError:
+        return None, None
 
 
 def derive_output_filename(filepath: str) -> str:
@@ -102,8 +144,8 @@ def process_log_file(filepath: str, dest_dir: str):
     """
     Full pipeline for a single log file:
     1. Read and decompress if needed
-    2. Extract timestamp from each line
-    3. Write simplified JSON to destination
+    2. Extract and normalize timestamp from each line
+    3. Write JSON to destination
     """
     print(f"  [*] Processing: {filepath}")
     lines = read_log_file(filepath)
@@ -112,16 +154,18 @@ def process_log_file(filepath: str, dest_dir: str):
         print(f"  [-] No content found in {filepath}, skipping.")
         return
 
-    source_filename = os.path.basename(filepath)
     records = []
 
     for line in lines:
         if not line.strip():
             continue
+
+        timestamp_str, time_epoch = parse_timestamp(line)
+
         records.append({
-            "timestamp": extract_timestamp(line),
+            "Timestamp": timestamp_str,
+            "TimeEpoch": time_epoch,
             "raw": line,
-            "source_file": source_filename,
         })
 
     if not records:
