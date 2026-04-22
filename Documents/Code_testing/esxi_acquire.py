@@ -34,10 +34,20 @@ import hashlib
 from datetime import datetime, timezone
 
 # ---------------------------------------------------------------------------
-# Known ESXi log filename prefixes to collect
+# Exact base names for logs where a prefix match would be too broad
+# e.g. "hostd" would also match "hostd-probe" so we match exactly instead
+# The base name is the filename stripped of its .log or .gz extension
+# e.g. hostd.log -> hostd, hostd.0.gz -> hostd
+# ---------------------------------------------------------------------------
+EXACT_BASE_NAMES = {
+    "hostd",
+    "vmware",
+}
+
+# ---------------------------------------------------------------------------
+# Prefix matches for logs where no ambiguity exists
 # ---------------------------------------------------------------------------
 KNOWN_LOG_PREFIXES = [
-    "hostd",
     "vpxa",
     "vmkernel",
     "auth",
@@ -103,17 +113,48 @@ def parse_timestamp(line: str):
 # File identification
 # ---------------------------------------------------------------------------
 
+def strip_extensions(filename: str) -> str:
+    """
+    Strip .log and .gz extensions to get the base name for matching.
+    e.g. hostd.log -> hostd
+         vpxa.0.gz -> vpxa.0
+         hostd-probe.0.gz -> hostd-probe.0
+    """
+    for ext in [".gz", ".log"]:
+        if filename.endswith(ext):
+            filename = filename[: -len(ext)]
+    return filename
+
+
 def is_esxi_log(filename: str) -> bool:
     """
-    Return True if the filename matches a known ESXi log prefix
-    and has a .log or .gz extension.
+    Return True if the filename matches a known ESXi log.
+
+    Two matching strategies:
+    - EXACT_BASE_NAMES : stripped base must equal the name exactly or as base.N
+                         e.g. hostd, hostd.0, hostd.1 all match
+                         but hostd-probe and hostd-probe.0 do not
+    - KNOWN_LOG_PREFIXES : standard prefix match for unambiguous log names
     """
     base = os.path.basename(filename).lower()
+
     if not (base.endswith(".log") or base.endswith(".gz")):
         return False
-    for prefix in KNOWN_LOG_PREFIXES:
-        if base.startswith(prefix):
+
+    stripped = strip_extensions(base)
+
+    # Exact match - stripped name must equal exact base or base.N (rotation number)
+    for exact in EXACT_BASE_NAMES:
+        if stripped == exact:
             return True
+        if re.match(r"^" + re.escape(exact) + r"\.\d+$", stripped):
+            return True
+
+    # Prefix match for unambiguous log names
+    for prefix in KNOWN_LOG_PREFIXES:
+        if stripped.startswith(prefix):
+            return True
+
     return False
 
 
