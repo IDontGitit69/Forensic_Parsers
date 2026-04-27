@@ -1,44 +1,39 @@
-Word VBA macro — paste into the VBA editor (Alt+F11 → Insert → Module)
-
-' ─────────────────────────────────────────────────
-' Uniform Crop + Resize — All Images in Document
-' Adjust the four values below, then run the macro.
-' ─────────────────────────────────────────────────
-
 Sub CropAndResizeAllImages()
 
     ' ── SETTINGS — change these values ──────────────
     Const FINAL_WIDTH_INCHES  As Double = 6.5  ' display width
     Const CROP_BOTTOM_INCHES  As Double = 0.0  ' trim from bottom
     Const CROP_RIGHT_INCHES   As Double = 0.0  ' trim from right
-    Const LOCK_ASPECT_RATIO   As Boolean = True ' keep proportions
     ' ─────────────────────────────────────────────────
 
     Dim oShape  As InlineShape
     Dim PPC     As Double
-    PPC = 72  ' points per inch
+    PPC = 72  ' points per inch (Word uses points internally)
 
     For Each oShape In ActiveDocument.InlineShapes
 
         If oShape.Type = wdInlineShapeLinkedPicture Or _
            oShape.Type = wdInlineShapePicture Then
 
-            With oShape.PictureFormat.Crop
+            ' Must go through the Shape wrapper to access crop
+            Dim oFreeShape As Shape
+            Set oFreeShape = oShape.Range.InlineShapes(1).ConvertToShape()
+
+            With oFreeShape.PictureFormat
                 .CropBottom = CROP_BOTTOM_INCHES * PPC
                 .CropRight  = CROP_RIGHT_INCHES  * PPC
             End With
 
-            If LOCK_ASPECT_RATIO Then
-                oShape.LockAspectRatio = msoTrue
-            End If
+            oFreeShape.LockAspectRatio = msoTrue
+            oFreeShape.Width = FINAL_WIDTH_INCHES * PPC
 
-            oShape.Width = FINAL_WIDTH_INCHES * PPC
+            ' Convert back to inline so it stays in the text flow
+            oFreeShape.ConvertToInlineShape
 
         End If
 
     Next oShape
 
-    MsgBox "Done! " & ActiveDocument.InlineShapes.Count & _
-           " image(s) updated.", vbInformation
+    MsgBox "Done!", vbInformation
 
 End Sub
