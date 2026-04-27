@@ -1,176 +1,44 @@
-Name: ESXi_Logs_Flexible
-Description: Collects ESXi logs and compressed rotated logs from vm-support bundles or forensic images
-Author: YourName
-Version: 1.0
-Id: f47ac10b-58cc-4372-a567-0e02b2c3d479
-RecreateDirectories: true
-Targets:
-  - Name: ESXi hostd log
-    Category: VMware ESXi
-    Path: \
-    FileMask: "hostd*.log"
-    Recursive: true
-    IsDirectory: false
+Word VBA macro — paste into the VBA editor (Alt+F11 → Insert → Module)
 
-  - Name: ESXi hostd compressed logs
-    Category: VMware ESXi
-    Path: \
-    FileMask: "hostd*.gz"
-    Recursive: true
-    IsDirectory: false
+' ─────────────────────────────────────────────────
+' Uniform Crop + Resize — All Images in Document
+' Adjust the four values below, then run the macro.
+' ─────────────────────────────────────────────────
 
-  - Name: ESXi vpxa log
-    Category: VMware ESXi
-    Path: \
-    FileMask: "vpxa*.log"
-    Recursive: true
-    IsDirectory: false
+Sub CropAndResizeAllImages()
 
-  - Name: ESXi vpxa compressed logs
-    Category: VMware ESXi
-    Path: \
-    FileMask: "vpxa*.gz"
-    Recursive: true
-    IsDirectory: false
+    ' ── SETTINGS — change these values ──────────────
+    Const FINAL_WIDTH_INCHES  As Double = 6.5  ' display width
+    Const CROP_BOTTOM_INCHES  As Double = 0.0  ' trim from bottom
+    Const CROP_RIGHT_INCHES   As Double = 0.0  ' trim from right
+    Const LOCK_ASPECT_RATIO   As Boolean = True ' keep proportions
+    ' ─────────────────────────────────────────────────
 
-  - Name: ESXi vmkernel log
-    Category: VMware ESXi
-    Path: \
-    FileMask: "vmkernel*.log"
-    Recursive: true
-    IsDirectory: false
+    Dim oShape  As InlineShape
+    Dim PPC     As Double
+    PPC = 72  ' points per inch
 
-  - Name: ESXi vmkernel compressed logs
-    Category: VMware ESXi
-    Path: \
-    FileMask: "vmkernel*.gz"
-    Recursive: true
-    IsDirectory: false
+    For Each oShape In ActiveDocument.InlineShapes
 
-  - Name: ESXi auth log
-    Category: VMware ESXi
-    Path: \
-    FileMask: "auth.log"
-    Recursive: true
-    IsDirectory: false
+        If oShape.Type = wdInlineShapeLinkedPicture Or _
+           oShape.Type = wdInlineShapePicture Then
 
-  - Name: ESXi auth compressed logs
-    Category: VMware ESXi
-    Path: \
-    FileMask: "auth*.gz"
-    Recursive: true
-    IsDirectory: false
+            With oShape.PictureFormat.Crop
+                .CropBottom = CROP_BOTTOM_INCHES * PPC
+                .CropRight  = CROP_RIGHT_INCHES  * PPC
+            End With
 
-  - Name: ESXi shell log
-    Category: VMware ESXi
-    Path: \
-    FileMask: "shell.log"
-    Recursive: true
-    IsDirectory: false
+            If LOCK_ASPECT_RATIO Then
+                oShape.LockAspectRatio = msoTrue
+            End If
 
-  - Name: ESXi shell compressed logs
-    Category: VMware ESXi
-    Path: \
-    FileMask: "shell*.gz"
-    Recursive: true
-    IsDirectory: false
+            oShape.Width = FINAL_WIDTH_INCHES * PPC
 
-  - Name: ESXi vobd log
-    Category: VMware ESXi
-    Path: \
-    FileMask: "vobd.log"
-    Recursive: true
-    IsDirectory: false
+        End If
 
-  - Name: ESXi vobd compressed logs
-    Category: VMware ESXi
-    Path: \
-    FileMask: "vobd*.gz"
-    Recursive: true
-    IsDirectory: false
+    Next oShape
 
-  - Name: ESXi esxupdate log
-    Category: VMware ESXi
-    Path: \
-    FileMask: "esxupdate.log"
-    Recursive: true
-    IsDirectory: false
+    MsgBox "Done! " & ActiveDocument.InlineShapes.Count & _
+           " image(s) updated.", vbInformation
 
-  - Name: ESXi esxupdate compressed logs
-    Category: VMware ESXi
-    Path: \
-    FileMask: "esxupdate*.gz"
-    Recursive: true
-    IsDirectory: false
-
-  - Name: ESXi vmksummary log
-    Category: VMware ESXi
-    Path: \
-    FileMask: "vmksummary*.log"
-    Recursive: true
-    IsDirectory: false
-
-  - Name: ESXi vmksummary compressed logs
-    Category: VMware ESXi
-    Path: \
-    FileMask: "vmksummary*.gz"
-    Recursive: true
-    IsDirectory: false
-
-  - Name: Per-VM vmware logs
-    Category: VMware ESXi
-    Path: \
-    FileMask: "vmware.log"
-    Recursive: true
-    IsDirectory: false
-
-  - Name: Per-VM vmware compressed logs
-    Category: VMware ESXi
-    Path: \
-    FileMask: "vmware*.gz"
-    Recursive: true
-    IsDirectory: false
-
-
-
-- Name: ESXi rhttproxy log
-    Category: VMware ESXi
-    Path: \
-    FileMask: "rhttproxy*.log"
-    Recursive: true
-    IsDirectory: false
-
-  - Name: ESXi rhttproxy compressed logs
-    Category: VMware ESXi
-    Path: \
-    FileMask: "rhttproxy*.gz"
-    Recursive: true
-    IsDirectory: false
-
-  - Name: ESXi vmauthd log
-    Category: VMware ESXi
-    Path: \
-    FileMask: "vmauthd*.log"
-    Recursive: true
-    IsDirectory: false
-
-  - Name: ESXi vmauthd compressed logs
-    Category: VMware ESXic
-    Path: \
-    FileMask: "vmauthd*.gz"
-    Recursive: true
-    IsDirectory: false
-
-  - Name: ESXi envoy-access log
-    Category: VMware ESXi
-    Path: \
-    FileMask: "envoy-access*.log"
-    Recursive: true
-    IsDirectory: false
-
-  - Name: ESXi envoy-access compressed logs
-    Category: VMware ESXi
-    Path: \
-    FileMask: "envoy-access*.gz"
-    Recursive: true
-    IsDirectory: false
+End Sub
