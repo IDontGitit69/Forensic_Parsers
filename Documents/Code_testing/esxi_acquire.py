@@ -77,7 +77,7 @@ KNOWN_LOG_PREFIXES = (
     "envoy-access",   # envoy-access.log, envoy-access.N.gz
     "syslog",
     "vmkwarning",
-    "vxpd-",          # vxpd-N.log, vxpd-N.log.gz
+    # vpxd- removed from here - handled by REGEX_PATTERNS below
     "websso_",        # websso_N.log.gz rotated variants
     "postgresql-",    # postgresql-Mon.log, postgresql-Mon.log-N.gz
 )
@@ -89,6 +89,15 @@ TIMESTAMP_PATTERN = re.compile(
 
 # Matches rotated exact-name variants e.g. hostd.0, vmware.3
 ROTATION_PATTERN = re.compile(r"^(.+)\.\d+$")
+
+# ---------------------------------------------------------------------------
+# Regex patterns for logs where neither exact name nor simple prefix is
+# precise enough. Each pattern is matched against the fully stripped basename.
+# e.g. vpxd-12345 matches, vpxd-svcs-access and vpxd-profiler-12345 do not.
+# ---------------------------------------------------------------------------
+REGEX_PATTERNS = [
+    re.compile(r"^vpxd-\d+$"),   # vpxd-12345.log, vpxd-12345.log.gz only
+]
 
 
 # ---------------------------------------------------------------------------
@@ -106,7 +115,7 @@ def strip_all_log_extensions(name: str) -> str:
     """
     Fully strip all known log extensions for deep pattern matching.
     Handles double extensions like postgresql-Mon.log-1.gz -> postgresql-Mon
-    and vxpd-1.log.gz -> vxpd-1
+    and vpxd-1.log.gz -> vpxd-1
     """
     for _ in range(3):  # max 3 passes covers any double extension
         if name.endswith(".gz") or name.endswith(".log"):
@@ -163,6 +172,11 @@ def is_esxi_log(filename: str) -> bool:
     # Prefix match for unambiguous names
     for prefix in KNOWN_LOG_PREFIXES:
         if stripped.startswith(prefix):
+            return True
+
+    # Regex match for names requiring precise numeric or format patterns
+    for pattern in REGEX_PATTERNS:
+        if pattern.match(stripped):
             return True
 
     return False
