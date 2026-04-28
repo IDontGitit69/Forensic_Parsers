@@ -41,12 +41,23 @@ import hashlib
 from datetime import datetime, timezone
 
 # ---------------------------------------------------------------------------
-# Exact base names - matched strictly to avoid e.g. hostd-probe matching hostd
-# The stripped base must equal the name exactly or as name.N (rotation number)
+# Exact base names - matched strictly to avoid partial prefix collisions
+# e.g. "hostd" would match "hostd-probe" with a prefix check so we
+# use exact matching here instead. Rotation variants (name.N) are also allowed.
 # ---------------------------------------------------------------------------
 EXACT_BASE_NAMES = frozenset([
     "hostd",
     "vmware",
+    "envoy",       # envoy.log - distinct from envoy-access which is prefix matched
+    "websso",      # websso.log - exact, websso_N.log.gz handled by prefix
+])
+
+# ---------------------------------------------------------------------------
+# Exact extensionless filenames - files with no .log or .gz extension
+# e.g. "messages", "messages.1"
+# ---------------------------------------------------------------------------
+EXACT_EXTENSIONLESS = frozenset([
+    "messages",
 ])
 
 # ---------------------------------------------------------------------------
@@ -63,9 +74,12 @@ KNOWN_LOG_PREFIXES = (
     "vmksummary",
     "rhttproxy",
     "vmauthd",
-    "envoy-access",
+    "envoy-access",   # envoy-access.log, envoy-access.N.gz
     "syslog",
     "vmkwarning",
+    "vxpd-",          # vxpd-N.log, vxpd-N.log.gz
+    "websso_",        # websso_N.log.gz rotated variants
+    "postgresql-",    # postgresql-Mon.log, postgresql-Mon.log-N.gz
 )
 
 # Compiled once at module level
@@ -88,17 +102,54 @@ def strip_log_extension(name: str) -> str:
     return name
 
 
+def strip_all_log_extensions(name: str) -> str:
+    """
+    Fully strip all known log extensions for deep pattern matching.
+    Handles double extensions like postgresql-Mon.log-1.gz -> postgresql-Mon
+    and vxpd-1.log.gz -> vxpd-1
+    """
+    for _ in range(3):  # max 3 passes covers any double extension
+        if name.endswith(".gz") or name.endswith(".log"):
+            name = name.rsplit(".", 1)[0]
+        else:
+            break
+    return name
+
+
 def is_esxi_log(filename: str) -> bool:
     """
     Return True if filename matches a known ESXi log.
+    Handles:
+      - .log and .gz extensions (standard)
+      - extensionless files like messages, messages.1
+      - double extensions like postgresql-Mon.log-1.gz
     Uses frozenset O(1) lookup for exact names, tuple iteration for prefixes.
     """
     base = filename.lower()
+    has_log_ext = base.endswith(".log") or base.endswith(".gz")
 
-    if not (base.endswith(".log") or base.endswith(".gz")):
+    # --- Extensionless files e.g. messages, messages.1, messages.1.gz ---
+    if not has_log_ext:
+        if base in EXACT_EXTENSIONLESS:
+            return True
+        # Rotated extensionless e.g. messages.1
+        m = ROTATION_PATTERN.match(base)
+        if m and m.group(1) in EXACT_EXTENSIONLESS:
+            return True
         return False
 
-    stripped = strip_log_extension(base)
+    # --- Compressed extensionless e.g. messages.1.gz ---
+    # After stripping .gz we may get messages.1 which has no .log ext
+    if base.endswith(".gz"):
+        inner = base[:-3]  # strip .gz
+        if inner in EXACT_EXTENSIONLESS:
+            return True
+        m = ROTATION_PATTERN.match(inner)
+        if m and m.group(1) in EXACT_EXTENSIONLESS:
+            return True
+
+    # Strip all log extensions for matching (handles double extensions)
+    stripped = strip_all_log_extensions(base)
 
     # Check exact names - also allow rotation variants e.g. hostd.0
     if stripped in EXACT_BASE_NAMES:
