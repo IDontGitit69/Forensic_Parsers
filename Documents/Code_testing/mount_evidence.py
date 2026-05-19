@@ -13,13 +13,26 @@ Supported formats
   .qcow2 / .qcow        QEMU image             → qemu-nbd + kpartx
   .aff / .afd           AFF image              → affuse + losetup + kpartx
 
+LVM support
+-----------
+  Partitions containing LVM Physical Volumes are automatically detected.
+  The Volume Group is imported under a prefixed name to avoid collisions
+  between evidence drives (e.g. two hosts both named "db_vg" → imported
+  as "EVIDENCE_host1_db_vg" and "EVIDENCE_host2_db_vg").
+  All Logical Volumes in each VG are then mounted under the image mount base.
+  udev auto-activation is suppressed during mounting to prevent the OS from
+  racing to claim VGs from evidence drives.
+
 Mount layout
 ------------
   /mnt/IOC_SCAN/
     Hostname1/
       Hostname1_Disk0.E01/
-        part1/    ← filesystem mount
-        part2/
+        part1/           ← regular filesystem partition
+        part2_lvm/       ← LVM container partition
+          lv_root/       ← logical volume mount
+          lv_home/
+          lv_var/
     Hostname2/
       Hostname2_vmdk0.vmdk/
         part1/
@@ -42,12 +55,13 @@ Options
   -w, --readwrite        Read-write (forensically UNSAFE)
   -d, --dry-run          Print actions without executing
   -u, --unmount          Tear down all mounts under mount-base
+      --nbd-max N        Override NBD slot count (reload nbd module with nbds_max=N)
   -v, --verbose          Show debug output
   -h, --help             Show this help
 
 Dependencies
 ------------
-  apt install ewf-tools qemu-utils kpartx ntfs-3g util-linux afflib-tools
+  apt install ewf-tools qemu-utils kpartx ntfs-3g util-linux afflib-tools lvm2
 """
 
 from __future__ import annotations
@@ -83,13 +97,13 @@ QCOW_EXTS        = {".qcow2", ".qcow"}
 AFF_EXTS         = {".aff", ".afd", ".afm"}
 ALL_EXTS         = EWF_FIRST_EXTS | RAW_EXTS | VMDK_EXTS | QCOW_EXTS | AFF_EXTS
 
-# Partition types that are never mountable as filesystems — skip immediately.
-# These are identified by blkid PART_ENTRY_TYPE or TYPE values.
+# Partition types that cannot be mounted directly as filesystems.
+# LVM2_member is NOT in this list — we handle it via lvm_activate_partition().
+# crypto_LUKS would need a key so we skip it with a clear message.
 UNMOUNTABLE_FS_TYPES = {
-    "swap",           # Linux swap
-    "linux_raid_member",  # mdadm RAID component
-    "LVM2_member",    # LVM physical volume
-    "crypto_LUKS",    # LUKS encrypted (would need key)
+    "swap",                # Linux swap — no filesystem
+    "linux_raid_member",   # mdadm RAID component — needs array assembly
+    "crypto_LUKS",         # LUKS encrypted — needs decryption key
 }
 
 # Per-filesystem mount attempt chains (read-only).
@@ -239,12 +253,13 @@ def setup_logging(log_file: str, verbose: bool) -> logging.Logger:
 @dataclass
 class MountState:
     """Persisted per-image mount state for reliable teardown."""
-    image_path:   str = ""
-    mount_base:   str = ""
-    loop_devices: list[str] = field(default_factory=list)
-    nbd_devices:  list[str] = field(default_factory=list)
-    fuse_mounts:  list[str] = field(default_factory=list)
-    partitions:   list[str] = field(default_factory=list)   # mounted partition paths
+    image_path:        str = ""
+    mount_base:        str = ""
+    loop_devices:      list[str] = field(default_factory=list)
+    nbd_devices:       list[str] = field(default_factory=list)
+    fuse_mounts:       list[str] = field(default_factory=list)
+    partitions:        list[str] = field(default_factory=list)  # mounted fs paths
+    lvm_volume_groups: list[str] = field(default_factory=list)  # imported VG names
 
     def save(self) -> None:
         path = Path(self.mount_base) / STATE_FILE
@@ -313,11 +328,14 @@ def cmd_output(cmd: list[str]) -> str:
 def check_deps() -> None:
     required = ["losetup", "kpartx", "blkid"]
     optional = {
-        "ewfmount":  "E01/EWF images (apt install ewf-tools)",
-        "qemu-nbd":  "VMDK/QCOW2 images (apt install qemu-utils)",
-        "affuse":    "AFF images (apt install afflib-tools)",
-        "ntfs-3g":   "NTFS filesystems (apt install ntfs-3g)",
-        "fusermount": "FUSE unmounting (apt install fuse)",
+        "ewfmount":       "E01/EWF images (apt install ewf-tools)",
+        "qemu-nbd":       "VMDK/QCOW2 images (apt install qemu-utils)",
+        "affuse":         "AFF images (apt install afflib-tools)",
+        "ntfs-3g":        "NTFS filesystems (apt install ntfs-3g)",
+        "fusermount":     "FUSE unmounting (apt install fuse)",
+        "vgimportclone":  "LVM volume groups (apt install lvm2)",
+        "pvs":            "LVM PV detection (apt install lvm2)",
+        "dmsetup":        "Device mapper cleanup (apt install dmsetup)",
     }
 
     missing_required = [t for t in required if not shutil.which(t)]
@@ -601,30 +619,334 @@ def describe_partition(dev: str) -> str:
     return ", ".join(parts) if parts else "unknown"
 
 
-# ── Partition mounter ─────────────────────────────────────────────────────────
+# ── LVM helpers ───────────────────────────────────────────────────────────────
+#
+# LVM on evidence drives is extremely common — RHEL/CentOS/Ubuntu Server all
+# use LVM by default. The challenge is:
+#
+#   1. udev auto-activation: when kpartx creates /dev/mapper/loopXpY devices,
+#      udev fires lvm2 rules that scan for PVs and auto-activate any VG they
+#      find. This happens asynchronously and without the script's knowledge,
+#      creating /dev/mapper/<vg>-<lv> entries that aren't tracked in state.
+#
+#   2. VG name collisions: two seized hosts that both have a VG named "db_vg"
+#      cannot be active simultaneously — LVM refuses to activate a duplicate.
+#
+#   3. Teardown: `kpartx -d` and `losetup -d` fail if LVM is still holding
+#      the underlying device open. `dmsetup remove` is needed first, but only
+#      works once VGs are properly deactivated.
+#
+# Our approach:
+#   • Suppress udev LVM auto-activation before mounting any images
+#   • After kpartx maps partitions, scan each one with `pvs` for PVs
+#   • Import/rename each VG to EVIDENCE_<hostname>_<vg_name> to avoid clashes
+#   • Activate the renamed VG read-only
+#   • Mount all its LVs under <mp_base>/part<N>_lvm/<lv_name>/
+#   • Record every imported VG name in MountState for teardown
+#   • On unmount: deactivate VGs → dmsetup remove any strays → then kpartx/NBD
+# ──────────────────────────────────────────────────────────────────────────────
+
+LVM_PREFIX = "EVIDENCE"   # prefix applied to all imported VG names
+
+
+def lvm_suppress_udev(suppress: bool) -> None:
+    """
+    Tell the lvm2 udev rules to stop auto-activating VGs.
+
+    Sets/clears the LVM_SUPPRESS_FD_WARNINGS env var and writes a global
+    filter to /etc/lvm/lvmlocal.conf that disables event-based activation.
+    This prevents udev from racing us to claim VGs from evidence devices.
+    """
+    conf_path = Path("/run/mount_evidence_lvm_suppress.conf")
+    if suppress:
+        conf_path.write_text(
+            "activation {\n"
+            "    auto_activation_volume_list = []\n"  # activate nothing automatically
+            "}\n"
+        )
+        # Tell lvm commands to use our override config
+        os.environ["LVM_SYSTEM_DIR"] = "/run"
+        log.debug("  LVM udev auto-activation suppressed")
+    else:
+        try:
+            conf_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        os.environ.pop("LVM_SYSTEM_DIR", None)
+        log.debug("  LVM udev auto-activation restored")
+
+
+def lvm_pvs_on_device(dev: str) -> list[str]:
+    """
+    Return a list of VG names that have a Physical Volume on dev.
+    Returns empty list if dev is not an LVM PV or lvm2 is not installed.
+    """
+    if not shutil.which("pvs"):
+        return []
+    out = cmd_output([
+        "pvs", "--noheadings", "--readonly",
+        "-o", "vg_name",
+        "--devices", dev,
+        dev,
+    ])
+    vgs = [line.strip() for line in out.splitlines() if line.strip()]
+    return vgs
+
+
+def lvm_import_vg(vg_name: str, pv_dev: str, hostname: str,
+                  dry_run: bool) -> Optional[str]:
+    """
+    Import a VG from a PV device under a collision-safe renamed name.
+
+    The imported name is:  EVIDENCE_<hostname>_<original_vg_name>
+    e.g. "db_vg" on host "vcenter01" → "EVIDENCE_vcenter01_db_vg"
+
+    Uses vgimportclone which:
+      - Assigns a new UUID to the VG (avoids UUID conflicts)
+      - Renames the VG to the name we specify
+      - Does NOT modify the on-disk metadata (safe for read-only evidence)
+    """
+    if not shutil.which("vgimportclone"):
+        log.warning("  vgimportclone not found — install lvm2 for LVM support")
+        return None
+
+    # Sanitise hostname for use in VG name (LVM VG names: [a-zA-Z0-9._+-])
+    safe_host = re.sub(r"[^a-zA-Z0-9._+\-]", "-", hostname)[:32]
+    safe_vg   = re.sub(r"[^a-zA-Z0-9._+\-]", "-", vg_name)[:32]
+    new_name  = f"{LVM_PREFIX}_{safe_host}_{safe_vg}"
+
+    # Truncate if over LVM's 127-char VG name limit
+    new_name = new_name[:127]
+
+    log.info(f"    Importing VG '{vg_name}' as '{new_name}'")
+
+    try:
+        run([
+            "vgimportclone",
+            "--import",
+            "--basevgname", new_name,
+            pv_dev,
+        ], dry_run=dry_run, check=True, capture=True)
+    except RuntimeError as e:
+        log.error(f"    vgimportclone failed for VG '{vg_name}' on {pv_dev}: {e}")
+        return None
+
+    return new_name if not dry_run else f"{new_name}_DRYRUN"
+
+
+def lvm_activate_vg(vg_name: str, readonly: bool, dry_run: bool) -> bool:
+    """Activate all LVs in a VG. Uses read-only activation for forensic safety."""
+    if not shutil.which("vgchange"):
+        return False
+
+    activation_flag = "-aly" if not readonly else "-aly"
+    # For read-only: activate with --permission r
+    cmd = ["vgchange", activation_flag, "--permission", "r" if readonly else "rw", vg_name]
+
+    try:
+        run(cmd, dry_run=dry_run, check=True, capture=True)
+        log.info(f"    Activated VG '{vg_name}' ({'read-only' if readonly else 'read-write'})")
+        return True
+    except RuntimeError as e:
+        log.warning(f"    vgchange activate failed for '{vg_name}': {e}")
+        # Try without --permission flag (older lvm2 versions)
+        try:
+            run(["vgchange", "-aly", vg_name],
+                dry_run=dry_run, check=True, capture=True)
+            return True
+        except RuntimeError:
+            return False
+
+
+def lvm_list_lvs(vg_name: str) -> list[str]:
+    """Return a list of LV device paths for all LVs in vg_name."""
+    if not shutil.which("lvs"):
+        return []
+    out = cmd_output([
+        "lvs", "--noheadings", "--readonly",
+        "-o", "lv_name",
+        vg_name,
+    ])
+    lv_names = [line.strip() for line in out.splitlines() if line.strip()]
+    # LV device paths are /dev/<vg_name>/<lv_name>
+    return [f"/dev/{vg_name}/{lv}" for lv in lv_names]
+
+
+def lvm_deactivate_vg(vg_name: str, dry_run: bool) -> None:
+    """Deactivate all LVs in a VG so the underlying device can be released."""
+    try:
+        run(["vgchange", "-aln", vg_name],
+            dry_run=dry_run, check=False, capture=True)
+        log.info(f"  Deactivated VG: {vg_name}")
+    except Exception as e:
+        log.warning(f"  Failed to deactivate VG '{vg_name}': {e}")
+
+
+def lvm_activate_partition(part: str, part_label: str, mp_base: Path,
+                            hostname: str, readonly: bool,
+                            state: MountState, dry_run: bool) -> int:
+    """
+    Given a partition device that is an LVM PV, import its VG, activate it,
+    and mount all its Logical Volumes. Returns number of LVs mounted.
+
+    Mount layout:
+        mp_base/
+          <part_label>_lvm/
+            <lv_name>/
+            <lv_name>/
+    """
+    log.info(f"    LVM Physical Volume detected on {part}")
+
+    # Find which VG(s) live on this PV
+    vg_names = lvm_pvs_on_device(part) if not dry_run else ["dryrun_vg"]
+    if not vg_names:
+        log.warning(f"    Could not identify VG on {part} — pvs returned nothing")
+        return 0
+
+    lvm_mp_base = mp_base / f"{part_label}_lvm"
+    lvm_mp_base.mkdir(parents=True, exist_ok=True)
+
+    total_mounted = 0
+
+    for vg_name in vg_names:
+        if not vg_name:
+            continue
+
+        # Import under a collision-safe name
+        imported_name = lvm_import_vg(vg_name, part, hostname, dry_run)
+        if not imported_name:
+            continue
+
+        # Activate the VG
+        if not lvm_activate_vg(imported_name, readonly, dry_run):
+            log.error(f"    Could not activate VG '{imported_name}'")
+            continue
+
+        state.lvm_volume_groups.append(imported_name)
+
+        # List all LVs in the VG
+        lv_devs = lvm_list_lvs(imported_name) if not dry_run \
+                  else [f"/dev/{imported_name}/lv_root_DRYRUN"]
+
+        if not lv_devs:
+            log.warning(f"    VG '{imported_name}' has no logical volumes")
+            continue
+
+        log.info(f"    Found {len(lv_devs)} logical volume(s) in '{imported_name}'")
+
+        for lv_dev in lv_devs:
+            lv_name = Path(lv_dev).name
+            fs = detect_fs(lv_dev) if not dry_run else "ext4"
+
+            # Skip unreadable LV types
+            if fs in UNMOUNTABLE_FS_TYPES:
+                log.warning(f"      Skipping LV {lv_name} — type '{fs}' is not mountable")
+                continue
+
+            lv_mp = lvm_mp_base / lv_name
+            lv_mp.mkdir(parents=True, exist_ok=True)
+
+            log.info(f"      Mounting LV {lv_name} [{fs or 'unknown'}] → {lv_mp}")
+            if _do_mount(lv_dev, lv_mp, fs, readonly, dry_run):
+                state.partitions.append(str(lv_mp))
+                total_mounted += 1
+            else:
+                try:
+                    lv_mp.rmdir()
+                except Exception:
+                    pass
+
+    if total_mounted == 0:
+        try:
+            lvm_mp_base.rmdir()
+        except Exception:
+            pass
+
+    return total_mounted
+
+
+def dmsetup_remove_strays(dry_run: bool) -> None:
+    """
+    Remove any device mapper entries that weren't cleanly deactivated by LVM.
+    This replicates the manual: dmsetup ls | grep -v ^control | awk '{print $1}'
+    but is selective — only removes entries that look like LVM evidence VGs
+    (prefixed with EVIDENCE_) to avoid disturbing unrelated dm devices.
+    """
+    out = cmd_output(["dmsetup", "ls"])
+    if not out:
+        return
+
+    for line in out.splitlines():
+        name = line.split()[0] if line.split() else ""
+        if not name or name == "control":
+            continue
+
+        # Only touch our own prefixed VGs and their LVs
+        # dm names for LVs use dashes: vg_name-lv_name
+        if not name.startswith(LVM_PREFIX):
+            continue
+
+        log.info(f"  dmsetup remove stray: {name}")
+        try:
+            run(["dmsetup", "remove", "--force", name],
+                dry_run=dry_run, check=False, capture=True)
+        except Exception as e:
+            log.warning(f"  dmsetup remove failed for '{name}': {e}")
+
+
+def dmsetup_remove_all_strays(dry_run: bool) -> None:
+    """
+    More aggressive version used during --unmount when normal deactivation
+    failed. Removes ALL non-control dm entries matching our evidence prefix.
+    Mirrors the manual command that worked for you:
+      dmsetup ls | grep -v "^control" | awk '{print $1}' | while read name; do
+        dmsetup remove "$name"; done
+    but scoped to only EVIDENCE_ prefixed names for safety.
+    """
+    out = cmd_output(["dmsetup", "ls"])
+    if not out:
+        return
+
+    entries = []
+    for line in out.splitlines():
+        parts = line.split()
+        if parts and parts[0] != "control" and parts[0].startswith(LVM_PREFIX):
+            entries.append(parts[0])
+
+    if not entries:
+        log.debug("  No stray EVIDENCE_ dm entries found")
+        return
+
+    log.info(f"  Removing {len(entries)} stray device mapper entries...")
+    for name in entries:
+        log.info(f"    dmsetup remove --force {name}")
+        try:
+            run(["dmsetup", "remove", "--force", name],
+                dry_run=dry_run, check=False, capture=True)
+            time.sleep(0.1)
+        except Exception as e:
+            log.warning(f"    Failed: {e}")
 
 def mount_partitions(blk_dev: str, mp_base: Path, readonly: bool,
-                     state: MountState, dry_run: bool) -> int:
+                     state: MountState, dry_run: bool,
+                     hostname: str = "unknown") -> int:
     """
     Enumerate and mount ALL partitions on blk_dev under mp_base.
-    Returns number of successfully mounted partitions.
+    Returns number of successfully mounted partitions/volumes.
 
     Strategy:
       1. Run kpartx to map partition table entries → /dev/mapper/loopXpY
       2. For each mapped partition:
          a. Use blkid to detect filesystem type and partition metadata
-         b. Skip only truly unmountable types (swap, LVM PV, RAID member)
-         c. Try a chain of mount options from most-specific to most-generic
-         d. If blkid finds no fs type, still attempt a generic mount — the
-            kernel may recognise it even when blkid doesn't (e.g. FAT12 ESP)
-      3. If kpartx finds no partitions (flat image, no partition table),
-         attempt to mount the device directly.
+         b. If LVM2_member → hand off to lvm_activate_partition()
+         c. Skip truly unmountable types (swap, LUKS, RAID)
+         d. Otherwise try mount option chain, most-specific to generic
+      3. If kpartx finds no partitions, attempt direct mount of the device.
     """
     log.info(f"  Mapping partitions on {blk_dev}")
     parts = kpartx_add(blk_dev, dry_run=dry_run)
 
     if not parts:
-        # No partition table — whole device may be a filesystem
         log.warning(f"  No partition table on {blk_dev} — attempting direct mount")
         fs = detect_fs(blk_dev) if not dry_run else "ext4"
         mp = mp_base / "volume"
@@ -642,6 +964,7 @@ def mount_partitions(blk_dev: str, mp_base: Path, readonly: bool,
 
     mounted = 0
     for i, part in enumerate(parts, start=1):
+        part_label = f"part{i}"
         desc = describe_partition(part) if not dry_run else "dry-run"
         log.info(f"  Partition {i}: {part}  [{desc}]")
 
@@ -649,20 +972,30 @@ def mount_partitions(blk_dev: str, mp_base: Path, readonly: bool,
             info = blkid_info(part)
             fs   = info.get("TYPE", "").lower()
 
-            # Skip partitions that are structurally unmountable
-            if fs in UNMOUNTABLE_FS_TYPES:
-                log.warning(f"    Skipping {part} — type '{fs}' is not a mountable filesystem")
-                continue
-
-            # Log useful metadata before attempting mount
             if info.get("LABEL"):
                 log.info(f"    Label : {info['LABEL']}")
             if info.get("UUID"):
                 log.info(f"    UUID  : {info['UUID']}")
-        else:
-            fs = "ext4"  # dry-run placeholder
 
-        mp = mp_base / f"part{i}"
+            # ── LVM Physical Volume ────────────────────────────────────────
+            if fs == "lvm2_member":
+                n = lvm_activate_partition(
+                    part, part_label, mp_base, hostname, readonly, state, dry_run
+                )
+                mounted += n
+                continue
+
+            # ── Truly unmountable ──────────────────────────────────────────
+            if fs in UNMOUNTABLE_FS_TYPES:
+                log.warning(f"    Skipping {part} — '{fs}' cannot be mounted")
+                if fs == "crypto_luks":
+                    log.warning(f"    (LUKS encrypted — decryption key required)")
+                continue
+        else:
+            fs = "ext4"
+
+        # ── Regular filesystem ─────────────────────────────────────────────
+        mp = mp_base / part_label
         mp.mkdir(parents=True, exist_ok=True)
 
         if _do_mount(part, mp, fs, readonly, dry_run):
@@ -723,14 +1056,14 @@ def _do_mount(dev: str, mp: Path, fs: str, readonly: bool, dry_run: bool) -> boo
 # ── Format-specific mounters ──────────────────────────────────────────────────
 
 def mount_raw(img: Path, mp_base: Path, readonly: bool,
-              state: MountState, dry_run: bool) -> bool:
+              state: MountState, dry_run: bool, hostname: str = "unknown") -> bool:
     """Mount a raw/img/dd image."""
     log.info(f"Mounting RAW image: {img}")
     try:
         loop_dev = losetup_attach(str(img), readonly=readonly) if not dry_run \
                    else "/dev/loop_DRYRUN"
         state.loop_devices.append(loop_dev)
-        n = mount_partitions(loop_dev, mp_base, readonly, state, dry_run)
+        n = mount_partitions(loop_dev, mp_base, readonly, state, dry_run, hostname)
         return n > 0 or dry_run
     except RuntimeError as e:
         log.error(f"  RAW mount failed: {e}")
@@ -738,7 +1071,7 @@ def mount_raw(img: Path, mp_base: Path, readonly: bool,
 
 
 def mount_ewf(img: Path, mp_base: Path, readonly: bool,
-              state: MountState, dry_run: bool) -> bool:
+              state: MountState, dry_run: bool, hostname: str = "unknown") -> bool:
     """Mount an EWF (E01/Ex01/L01) image via ewfmount."""
     if not shutil.which("ewfmount"):
         log.error("ewfmount not found — install: sudo apt install ewf-tools")
@@ -750,7 +1083,6 @@ def mount_ewf(img: Path, mp_base: Path, readonly: bool,
     fuse_mp.mkdir(parents=True, exist_ok=True)
 
     try:
-        # ewfmount auto-discovers sibling segments (.E02, .E03 …)
         run(["ewfmount", str(img), str(fuse_mp)],
             dry_run=dry_run, check=True, capture=True)
         state.fuse_mounts.append(str(fuse_mp))
@@ -762,10 +1094,8 @@ def mount_ewf(img: Path, mp_base: Path, readonly: bool,
             pass
         return False
 
-    # ewfmount exposes the raw image as ewf1 inside the fuse mountpoint
     raw_file = fuse_mp / "ewf1"
     if not dry_run and not raw_file.exists():
-        # Some versions use a different name — look for any file
         candidates = list(fuse_mp.iterdir())
         if candidates:
             raw_file = candidates[0]
@@ -778,7 +1108,7 @@ def mount_ewf(img: Path, mp_base: Path, readonly: bool,
         loop_dev = losetup_attach(str(raw_file), readonly=readonly) if not dry_run \
                    else "/dev/loop_DRYRUN"
         state.loop_devices.append(loop_dev)
-        n = mount_partitions(loop_dev, mp_base, readonly, state, dry_run)
+        n = mount_partitions(loop_dev, mp_base, readonly, state, dry_run, hostname)
         return n > 0 or dry_run
     except RuntimeError as e:
         log.error(f"  EWF loop/partition mount failed: {e}")
@@ -839,7 +1169,7 @@ def _nbd_connect(img: Path, readonly: bool, state: MountState,
 
 
 def mount_vmdk(img: Path, mp_base: Path, readonly: bool,
-               state: MountState, dry_run: bool) -> bool:
+               state: MountState, dry_run: bool, hostname: str = "unknown") -> bool:
     """Mount a VMDK image via qemu-nbd."""
     if not shutil.which("qemu-nbd"):
         log.error("qemu-nbd not found — install: sudo apt install qemu-utils")
@@ -852,7 +1182,7 @@ def mount_vmdk(img: Path, mp_base: Path, readonly: bool,
         return False
 
     try:
-        n = mount_partitions(nbd_dev, mp_base, readonly, state, dry_run)
+        n = mount_partitions(nbd_dev, mp_base, readonly, state, dry_run, hostname)
         return n > 0 or dry_run
     except RuntimeError as e:
         log.error(f"  VMDK partition mount failed: {e}")
@@ -860,7 +1190,7 @@ def mount_vmdk(img: Path, mp_base: Path, readonly: bool,
 
 
 def mount_qcow2(img: Path, mp_base: Path, readonly: bool,
-                state: MountState, dry_run: bool) -> bool:
+                state: MountState, dry_run: bool, hostname: str = "unknown") -> bool:
     """Mount a QCOW2 image via qemu-nbd."""
     if not shutil.which("qemu-nbd"):
         log.error("qemu-nbd not found — install: sudo apt install qemu-utils")
@@ -881,7 +1211,7 @@ def mount_qcow2(img: Path, mp_base: Path, readonly: bool,
 
 
 def mount_aff(img: Path, mp_base: Path, readonly: bool,
-              state: MountState, dry_run: bool) -> bool:
+              state: MountState, dry_run: bool, hostname: str = "unknown") -> bool:
     """Mount an AFF image via affuse."""
     if not shutil.which("affuse"):
         log.error("affuse not found — install: sudo apt install afflib-tools")
@@ -917,7 +1247,7 @@ def mount_aff(img: Path, mp_base: Path, readonly: bool,
         loop_dev = losetup_attach(str(raw_file), readonly=readonly) if not dry_run \
                    else "/dev/loop_DRYRUN"
         state.loop_devices.append(loop_dev)
-        n = mount_partitions(loop_dev, mp_base, readonly, state, dry_run)
+        n = mount_partitions(loop_dev, mp_base, readonly, state, dry_run, hostname)
         return n > 0 or dry_run
     except RuntimeError as e:
         log.error(f"  AFF loop/partition mount failed: {e}")
@@ -927,11 +1257,11 @@ def mount_aff(img: Path, mp_base: Path, readonly: bool,
 # ── Image dispatcher ───────────────────────────────────────────────────────────
 
 MOUNTERS = {
-    **{ext: mount_ewf  for ext in EWF_FIRST_EXTS},
-    **{ext: mount_raw  for ext in RAW_EXTS},
-    **{ext: mount_vmdk for ext in VMDK_EXTS},
+    **{ext: mount_ewf   for ext in EWF_FIRST_EXTS},
+    **{ext: mount_raw   for ext in RAW_EXTS},
+    **{ext: mount_vmdk  for ext in VMDK_EXTS},
     **{ext: mount_qcow2 for ext in QCOW_EXTS},
-    **{ext: mount_aff  for ext in AFF_EXTS},
+    **{ext: mount_aff   for ext in AFF_EXTS},
 }
 
 
@@ -966,12 +1296,18 @@ def process_image(img_path: Path, hostname: str, label: str,
         log.warning(f"Unrecognised extension '{ext}' — attempting raw mount")
         mounter = mount_raw
 
-    ok = mounter(img_path, mp_base, readonly, state, dry_run)
+    # Suppress udev LVM auto-activation before attaching any block devices
+    # so the OS doesn't race us to claim VGs from the evidence drive
+    lvm_suppress_udev(True)
+    try:
+        ok = mounter(img_path, mp_base, readonly, state, dry_run, hostname=hostname)
+    finally:
+        lvm_suppress_udev(False)
+
     state.save()
 
     if not ok:
         log.error(f"Failed to mount: {img_path}")
-        # Clean up empty directory
         try:
             if mp_base.exists() and not any(mp_base.iterdir()):
                 mp_base.rmdir()
@@ -1069,23 +1405,37 @@ def unmount_all(mount_base: Path, dry_run: bool) -> None:
 
         log.info(f"\n── Unmounting: {state.image_path}")
 
-        # Teardown order matters:
-        #   1. Filesystem mounts (partition mountpoints) — must be unmounted
-        #      before the underlying block devices can be released
-        #   2. kpartx mappings — must be removed before loop/NBD detach
-        #   3. Loop devices — detach after kpartx is gone
-        #   4. NBD devices — disconnect + wait for kernel confirmation
-        #   5. FUSE mounts (ewfmount/affuse) — after loop devices that depend on them
+        # Teardown order — every layer must be clear before the one below it:
+        #   1. LV filesystem mounts  (deepest — LVs sit on top of VGs)
+        #   2. LVM VG deactivation   (VGs sit on top of PV partitions)
+        #   3. dmsetup stray cleanup (catches udev-auto-activated entries)
+        #   4. Partition fs mounts   (regular non-LVM partitions)
+        #   5. kpartx mappings       (partition maps on loop/NBD devices)
+        #   6. Loop device detach
+        #   7. NBD disconnect        (with kernel-confirmed release)
+        #   8. FUSE mounts           (ewfmount/affuse — deepest underlying layer)
 
-        # 1. Unmount partition filesystems (deepest path first)
+        # 1. Unmount all tracked filesystem mountpoints (LV and regular, deepest first)
         for mp in sorted(state.partitions, reverse=True):
             _umount(mp, dry_run)
 
-        # Small settle after filesystem unmounts before touching block devices
         if not dry_run:
             time.sleep(0.5)
 
-        # 2+3. kpartx remove + losetup detach
+        # 2. Deactivate LVM Volume Groups
+        for vg in state.lvm_volume_groups:
+            lvm_deactivate_vg(vg, dry_run)
+
+        if not dry_run and state.lvm_volume_groups:
+            time.sleep(0.5)
+
+        # 3. Clean up any stray dm entries (udev auto-activated VGs not in state)
+        dmsetup_remove_all_strays(dry_run)
+
+        if not dry_run and state.lvm_volume_groups:
+            time.sleep(0.3)
+
+        # 4+5. kpartx remove + losetup detach
         for dev in state.loop_devices:
             if not dry_run:
                 kpartx_remove(dev)
@@ -1094,11 +1444,11 @@ def unmount_all(mount_base: Path, dry_run: bool) -> None:
             else:
                 log.info(f"  [DRY-RUN] kpartx -d {dev} && losetup -d {dev}")
 
-        # 4. NBD disconnect — uses nbd_disconnect() which polls until truly free
+        # 6. NBD disconnect — polls until kernel confirms free
         for dev in state.nbd_devices:
             nbd_disconnect(dev, dry_run=dry_run)
 
-        # 5. FUSE mounts (ewfmount / affuse) — last, after loop devices are gone
+        # 7. FUSE mounts (ewfmount/affuse) — after loop devices that depend on them
         for mp in state.fuse_mounts:
             _umount(mp, dry_run)
 
