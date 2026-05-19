@@ -22,3 +22,8 @@ done
 for i in $(seq 0 31); do
     qemu-nbd --disconnect /dev/nbd${i} 2>/dev/null
 done
+
+
+sudo dmsetup ls | grep -v "^control" | awk '{print $1}' | while read name; do
+    sudo dmsetup remove "$name" 2>/dev/null && echo "Removed: $name"
+done
