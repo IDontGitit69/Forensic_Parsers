@@ -332,25 +332,185 @@ def check_deps() -> None:
 
 
 # ── NBD helpers ────────────────────────────────────────────────────────────────
+#
+# NBD slots are a finite kernel resource — /dev/nbd0 through /dev/nbd15 by
+# default (16 total). Each connected qemu-nbd process holds one slot until
+# explicitly disconnected. Slots are NOT released by unmounting partitions —
+# you must call `qemu-nbd --disconnect` AND wait for the kernel to confirm
+# the slot is free before it can be reused.
+#
+# Common failure modes:
+#   • find_free_nbd() returns a slot that looks free in /sys but the kernel
+#     hasn't finished releasing it yet after a recent disconnect → connect fails
+#   • --unmount doesn't wait for disconnect to complete → slots leak across runs
+#   • More than 16 VMDKs in one session → run out of slots entirely
+#
+# We handle all three with:
+#   1. nbd_is_free()    — multi-signal check (pid + size + qemu process)
+#   2. nbd_disconnect() — disconnect + poll until actually free (with timeout)
+#   3. nbd_get_max()    — read real slot count from module, warn if insufficient
+# ──────────────────────────────────────────────────────────────────────────────
 
-def load_nbd_module() -> None:
-    """Ensure nbd kernel module is loaded."""
+NBD_SETTLE_TIMEOUT = 15   # seconds to wait for a slot to become free
+NBD_SETTLE_POLL    = 0.5  # polling interval in seconds
+
+
+def load_nbd_module() -> int:
+    """
+    Ensure the nbd kernel module is loaded.
+    Returns the number of available NBD slots (nbds_max parameter).
+    """
     try:
         run(["modprobe", "nbd", "max_part=16"], check=True, capture=True)
         time.sleep(0.5)
     except Exception as e:
         log.warning(f"Could not load nbd module: {e}")
 
+    return nbd_get_max()
+
+
+def nbd_get_max() -> int:
+    """
+    Read the actual nbds_max value from the loaded nbd module.
+    Falls back to 16 if the sysfs path is unavailable.
+    """
+    param_path = Path("/sys/module/nbd/parameters/nbds_max")
+    try:
+        val = int(param_path.read_text().strip())
+        log.debug(f"  NBD slots available: {val}")
+        return val
+    except Exception:
+        return 16
+
+
+def nbd_is_free(index: int) -> bool:
+    """
+    Return True only if /dev/nbd<index> is genuinely free.
+
+    Checks three signals — all must be clear:
+      1. /sys/block/nbdX/pid does not exist (no qemu-nbd process attached)
+      2. /sys/block/nbdX/size reads 0 (no image connected)
+      3. No running qemu-nbd process references /dev/nbdX in its cmdline
+    """
+    dev_name = f"nbd{index}"
+    dev_path = f"/dev/{dev_name}"
+
+    # Signal 1: pid sysfs file must not exist
+    if Path(f"/sys/block/{dev_name}/pid").exists():
+        return False
+
+    # Signal 2: size must be 0
+    size_path = Path(f"/sys/block/{dev_name}/size")
+    try:
+        if int(size_path.read_text().strip()) != 0:
+            return False
+    except Exception:
+        pass  # if we can't read it, be optimistic
+
+    # Signal 3: no qemu-nbd process holding this device
+    # Check /proc/*/cmdline for any process referencing this device path
+    try:
+        proc_dir = Path("/proc")
+        for pid_dir in proc_dir.iterdir():
+            if not pid_dir.name.isdigit():
+                continue
+            cmdline_path = pid_dir / "cmdline"
+            try:
+                cmdline = cmdline_path.read_bytes().replace(b"\x00", b" ").decode(errors="ignore")
+                if dev_path in cmdline and "qemu-nbd" in cmdline:
+                    return False
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return True
+
 
 def find_free_nbd() -> Optional[str]:
-    """Return the path to a free /dev/nbdX device."""
-    for i in range(16):
-        pid_path = Path(f"/sys/block/nbd{i}/pid")
-        if not pid_path.exists():
-            dev = f"/dev/nbd{i}"
-            if Path(dev).exists():
-                return dev
-    return None
+    """
+    Return the path to a genuinely free /dev/nbdX device.
+    Uses nbd_is_free() for a thorough check rather than just looking at pid.
+    Logs a warning if slots are running low (≤2 remaining).
+    """
+    max_slots = nbd_get_max()
+    free_slots = []
+
+    for i in range(max_slots):
+        dev = f"/dev/nbd{i}"
+        if not Path(dev).exists():
+            continue
+        if nbd_is_free(i):
+            free_slots.append((i, dev))
+
+    if not free_slots:
+        log.error(
+            f"All {max_slots} NBD slots are in use. "
+            f"Run with --unmount first, or increase slots: "
+            f"rmmod nbd && modprobe nbd nbds_max=32"
+        )
+        return None
+
+    if len(free_slots) <= 2:
+        log.warning(
+            f"Only {len(free_slots)} NBD slot(s) remaining out of {max_slots}. "
+            f"Consider --unmount between batches or increase nbds_max."
+        )
+
+    chosen_idx, chosen_dev = free_slots[0]
+    log.debug(f"  Allocated NBD slot: {chosen_dev} ({len(free_slots)-1} remaining after this)")
+    return chosen_dev
+
+
+def nbd_disconnect(dev: str, dry_run: bool = False) -> bool:
+    """
+    Disconnect a qemu-nbd device and wait until the kernel confirms it is free.
+
+    Returns True if the device is free after the operation, False on timeout.
+
+    Why the wait loop is necessary:
+      qemu-nbd --disconnect returns immediately after sending the disconnect
+      ioctl, but the kernel releases the slot asynchronously. If you try to
+      reconnect (or check the slot) before the kernel finishes, it appears
+      busy and the next connect fails with "device busy".
+    """
+    if dry_run:
+        log.info(f"  [DRY-RUN] qemu-nbd --disconnect {dev}")
+        return True
+
+    log.info(f"  Disconnecting NBD: {dev}")
+
+    # First remove kpartx mappings so the device isn't busy
+    kpartx_remove(dev)
+    time.sleep(0.3)
+
+    # Issue the disconnect
+    try:
+        run(["qemu-nbd", "--disconnect", dev], check=False, capture=True, timeout=10)
+    except Exception as e:
+        log.warning(f"  qemu-nbd --disconnect returned error for {dev}: {e}")
+
+    # Extract the index number from /dev/nbdX
+    try:
+        index = int(re.search(r"\d+$", dev).group())
+    except Exception:
+        log.warning(f"  Could not parse NBD index from {dev}")
+        return False
+
+    # Poll until the kernel confirms the slot is free
+    deadline = time.monotonic() + NBD_SETTLE_TIMEOUT
+    while time.monotonic() < deadline:
+        if nbd_is_free(index):
+            log.info(f"  NBD slot {dev} confirmed free")
+            return True
+        time.sleep(NBD_SETTLE_POLL)
+
+    log.warning(
+        f"  NBD slot {dev} still appears busy after {NBD_SETTLE_TIMEOUT}s — "
+        f"it may release on its own. If problems persist: "
+        f"sudo rmmod nbd && sudo modprobe nbd max_part=16"
+    )
+    return False
 
 
 # ── losetup helpers ────────────────────────────────────────────────────────────
@@ -625,6 +785,59 @@ def mount_ewf(img: Path, mp_base: Path, readonly: bool,
         return False
 
 
+def _nbd_connect(img: Path, readonly: bool, state: MountState,
+                 dry_run: bool, label: str) -> Optional[str]:
+    """
+    Shared NBD connect logic for VMDK and QCOW2.
+    Finds a free slot, connects qemu-nbd, verifies the connection by checking
+    that the device size is non-zero, and records the device in state.
+    Returns the nbd device path on success, None on failure.
+    """
+    load_nbd_module()
+
+    nbd_dev = find_free_nbd() if not dry_run else "/dev/nbd_DRYRUN"
+    if not nbd_dev:
+        return None
+
+    ro_flag = ["--read-only"] if readonly else []
+    try:
+        run(["qemu-nbd", "--connect", nbd_dev] + ro_flag + [str(img)],
+            dry_run=dry_run, check=True, capture=True, timeout=30)
+    except RuntimeError as e:
+        log.error(f"  qemu-nbd connect failed for {label}: {e}")
+        return None
+
+    if not dry_run:
+        # Verify the device actually connected by polling size
+        # qemu-nbd returns before the kernel has fully set up the device
+        index = int(re.search(r"\d+$", nbd_dev).group())
+        size_path = Path(f"/sys/block/nbd{index}/size")
+        deadline = time.monotonic() + 10
+        connected = False
+        while time.monotonic() < deadline:
+            try:
+                if int(size_path.read_text().strip()) > 0:
+                    connected = True
+                    break
+            except Exception:
+                pass
+            time.sleep(0.25)
+
+        if not connected:
+            log.error(f"  qemu-nbd connected to {nbd_dev} but device size is 0 — image may be corrupt or unsupported")
+            # Clean up the bad connection
+            try:
+                run(["qemu-nbd", "--disconnect", nbd_dev], check=False, capture=True, timeout=10)
+            except Exception:
+                pass
+            return None
+
+        log.debug(f"  {label} connected to {nbd_dev} (verified non-zero size)")
+
+    state.nbd_devices.append(nbd_dev)
+    return nbd_dev
+
+
 def mount_vmdk(img: Path, mp_base: Path, readonly: bool,
                state: MountState, dry_run: bool) -> bool:
     """Mount a VMDK image via qemu-nbd."""
@@ -633,21 +846,9 @@ def mount_vmdk(img: Path, mp_base: Path, readonly: bool,
         return False
 
     log.info(f"Mounting VMDK image: {img}")
-    load_nbd_module()
 
-    nbd_dev = find_free_nbd() if not dry_run else "/dev/nbd_DRYRUN"
+    nbd_dev = _nbd_connect(img, readonly, state, dry_run, label=img.name)
     if not nbd_dev:
-        log.error("No free NBD device available (max 16 in use)")
-        return False
-
-    ro_flag = ["--read-only"] if readonly else []
-    try:
-        run(["qemu-nbd", "--connect", nbd_dev] + ro_flag + [str(img)],
-            dry_run=dry_run, check=True, capture=True)
-        time.sleep(1)  # kernel needs time to read partition table
-        state.nbd_devices.append(nbd_dev)
-    except RuntimeError as e:
-        log.error(f"  qemu-nbd connect failed: {e}")
         return False
 
     try:
@@ -666,21 +867,9 @@ def mount_qcow2(img: Path, mp_base: Path, readonly: bool,
         return False
 
     log.info(f"Mounting QCOW2 image: {img}")
-    load_nbd_module()
 
-    nbd_dev = find_free_nbd() if not dry_run else "/dev/nbd_DRYRUN"
+    nbd_dev = _nbd_connect(img, readonly, state, dry_run, label=img.name)
     if not nbd_dev:
-        log.error("No free NBD device available")
-        return False
-
-    ro_flag = ["--read-only"] if readonly else []
-    try:
-        run(["qemu-nbd", "--connect", nbd_dev] + ro_flag + [str(img)],
-            dry_run=dry_run, check=True, capture=True)
-        time.sleep(1)
-        state.nbd_devices.append(nbd_dev)
-    except RuntimeError as e:
-        log.error(f"  qemu-nbd connect failed: {e}")
         return False
 
     try:
@@ -880,28 +1069,36 @@ def unmount_all(mount_base: Path, dry_run: bool) -> None:
 
         log.info(f"\n── Unmounting: {state.image_path}")
 
-        # a. Unmount partition mount points (deepest first)
+        # Teardown order matters:
+        #   1. Filesystem mounts (partition mountpoints) — must be unmounted
+        #      before the underlying block devices can be released
+        #   2. kpartx mappings — must be removed before loop/NBD detach
+        #   3. Loop devices — detach after kpartx is gone
+        #   4. NBD devices — disconnect + wait for kernel confirmation
+        #   5. FUSE mounts (ewfmount/affuse) — after loop devices that depend on them
+
+        # 1. Unmount partition filesystems (deepest path first)
         for mp in sorted(state.partitions, reverse=True):
             _umount(mp, dry_run)
 
-        # b. Detach loop devices
+        # Small settle after filesystem unmounts before touching block devices
+        if not dry_run:
+            time.sleep(0.5)
+
+        # 2+3. kpartx remove + losetup detach
         for dev in state.loop_devices:
             if not dry_run:
                 kpartx_remove(dev)
+                time.sleep(0.3)
                 losetup_detach(dev)
             else:
                 log.info(f"  [DRY-RUN] kpartx -d {dev} && losetup -d {dev}")
 
-        # c. Disconnect NBD devices
+        # 4. NBD disconnect — uses nbd_disconnect() which polls until truly free
         for dev in state.nbd_devices:
-            try:
-                run(["qemu-nbd", "--disconnect", dev],
-                    dry_run=dry_run, check=False, capture=True)
-                log.info(f"  Disconnected NBD: {dev}")
-            except Exception as e:
-                log.warning(f"  NBD disconnect failed for {dev}: {e}")
+            nbd_disconnect(dev, dry_run=dry_run)
 
-        # d. Unmount FUSE mounts
+        # 5. FUSE mounts (ewfmount / affuse) — last, after loop devices are gone
         for mp in state.fuse_mounts:
             _umount(mp, dry_run)
 
@@ -1038,6 +1235,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Unmount everything under mount-base")
     p.add_argument("-v", "--verbose", action="store_true",
                    help="Verbose/debug output")
+    p.add_argument("--nbd-max", type=int, default=0, metavar="N",
+                   help=(
+                       "Override the number of NBD slots by reloading the nbd module "
+                       "with nbds_max=N. Default 16 is often too few for VCenter cases "
+                       "with 11+ VMDKs. Example: --nbd-max 32. "
+                       "Requires no NBD devices currently in use."
+                   ))
     return p
 
 
@@ -1078,6 +1282,23 @@ def main() -> int:
 
     check_deps()
     mount_base.mkdir(parents=True, exist_ok=True)
+
+    # Expand NBD slots if requested
+    if args.nbd_max > 0:
+        current = nbd_get_max()
+        if args.nbd_max != current:
+            log.info(f"Reloading nbd module with nbds_max={args.nbd_max} (was {current})")
+            try:
+                run(["rmmod", "nbd"], check=True, capture=True)
+                run(["modprobe", "nbd", f"max_part=16", f"nbds_max={args.nbd_max}"],
+                    check=True, capture=True)
+                time.sleep(0.5)
+                actual = nbd_get_max()
+                log.info(f"NBD slots now: {actual}")
+            except RuntimeError as e:
+                log.warning(f"Could not reload nbd module: {e} — continuing with {current} slots")
+        else:
+            log.debug(f"NBD slots already at {current}, --nbd-max {args.nbd_max} is a no-op")
 
     # Discover images
     images = discover_images(evidence_root)
