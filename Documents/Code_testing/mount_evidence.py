@@ -377,9 +377,14 @@ def load_nbd_module() -> int:
     """
     Ensure the nbd kernel module is loaded.
     Returns the number of available NBD slots (nbds_max parameter).
+
+    NOTE: max_part=0 is intentional. Setting max_part>0 makes the kernel
+    auto-create /dev/nbdXpY partition devices, duplicating what kpartx creates
+    in /dev/mapper/. LVM sees both sets as separate PVs and reports duplicate
+    devices, refusing to activate. kpartx handles all partition mapping.
     """
     try:
-        run(["modprobe", "nbd", "max_part=16"], check=True, capture=True)
+        run(["modprobe", "nbd", "max_part=0"], check=True, capture=True)
         time.sleep(0.5)
     except Exception as e:
         log.warning(f"Could not load nbd module: {e}")
@@ -534,8 +539,16 @@ def nbd_disconnect(dev: str, dry_run: bool = False) -> bool:
 # ── losetup helpers ────────────────────────────────────────────────────────────
 
 def losetup_attach(image_path: str, readonly: bool = True) -> str:
-    """Attach an image file as a loop device. Returns the device path."""
-    cmd = ["losetup", "--find", "--show", "--partscan"]
+    """
+    Attach an image file as a loop device. Returns the device path.
+
+    NOTE: --partscan is intentionally NOT used here. It would make the kernel
+    auto-create /dev/loopXpY partition devices at the same time kpartx creates
+    /dev/mapper/loopXpY — two sets of devices pointing at the same partitions.
+    LVM sees this as duplicate PVs and refuses to activate. kpartx is our sole
+    partition mapper; losetup just attaches the raw image as a block device.
+    """
+    cmd = ["losetup", "--find", "--show"]
     if readonly:
         cmd.append("--read-only")
     cmd.append(image_path)
@@ -1491,7 +1504,7 @@ def main() -> int:
             log.info(f"Reloading nbd module with nbds_max={args.nbd_max} (was {current})")
             try:
                 run(["rmmod", "nbd"], check=True, capture=True)
-                run(["modprobe", "nbd", f"max_part=16", f"nbds_max={args.nbd_max}"],
+                run(["modprobe", "nbd", "max_part=0", f"nbds_max={args.nbd_max}"],
                     check=True, capture=True)
                 time.sleep(0.5)
                 actual = nbd_get_max()
