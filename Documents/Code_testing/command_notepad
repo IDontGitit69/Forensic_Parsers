@@ -1,39 +1,5 @@
-Sub CropAndResizeAllImages()
-
-    ' ── SETTINGS — change these values ──────────────
-    Const FINAL_WIDTH_INCHES  As Double = 6.5  ' display width
-    Const CROP_BOTTOM_INCHES  As Double = 0.0  ' trim from bottom
-    Const CROP_RIGHT_INCHES   As Double = 0.0  ' trim from right
-    ' ─────────────────────────────────────────────────
-
-    Dim oShape  As InlineShape
-    Dim PPC     As Double
-    PPC = 72  ' points per inch (Word uses points internally)
-
-    For Each oShape In ActiveDocument.InlineShapes
-
-        If oShape.Type = wdInlineShapeLinkedPicture Or _
-           oShape.Type = wdInlineShapePicture Then
-
-            ' Must go through the Shape wrapper to access crop
-            Dim oFreeShape As Shape
-            Set oFreeShape = oShape.Range.InlineShapes(1).ConvertToShape()
-
-            With oFreeShape.PictureFormat
-                .CropBottom = CROP_BOTTOM_INCHES * PPC
-                .CropRight  = CROP_RIGHT_INCHES  * PPC
-            End With
-
-            oFreeShape.LockAspectRatio = msoTrue
-            oFreeShape.Width = FINAL_WIDTH_INCHES * PPC
-
-            ' Convert back to inline so it stays in the text flow
-            oFreeShape.ConvertToInlineShape
-
-        End If
-
-    Next oShape
-
-    MsgBox "Done!", vbInformation
-
-End Sub
+for i in $(seq 0 31); do
+    if [ -e "/sys/block/nbd${i}/pid" ] || [ "$(cat /sys/block/nbd${i}/size 2>/dev/null)" != "0" ]; then
+        echo "nbd${i} is active"
+    fi
+done
