@@ -12,3 +12,8 @@ for i in $(seq 0 31); do
         qemu-nbd --disconnect /dev/nbd${i} 2>/dev/null
     fi
 done
+
+
+for i in $(seq 0 31); do
+    kpartx -d /dev/nbd${i} 2>/dev/null
+done
