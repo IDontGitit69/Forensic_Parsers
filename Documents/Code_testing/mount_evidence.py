@@ -644,30 +644,38 @@ def nbd_disconnect(dev: str, dry_run: bool):
 # ── Partition discovery ───────────────────────────────────────────────────────
 def get_partitions_for(dev: str, use_kpartx: bool, dry_run: bool) -> list[str]:
     """
-    Return the list of partition device paths for a block device.
+    Return partition device paths for a block device.
 
-    For loop devices  → use kpartx (/dev/mapper/loopXpY)
-    For NBD devices   → read /dev/nbdXpY directly (qemu-nbd already created them)
+    Loop devices → kpartx → /dev/mapper/loopXpY
+    NBD devices  → check for /dev/nbdXpY first (created when max_part>0),
+                   fall back to kpartx → /dev/mapper/nbdXpY when max_part=0.
 
-    This is the key fix for the duplicate device problem:
-    qemu-nbd with a connected VMDK automatically exposes partition devices at
-    /dev/nbd0p1, /dev/nbd0p2 etc. If we ALSO run kpartx on it, we get a
-    second set in /dev/mapper/ — LVM then sees the same PV UUID twice and
-    reports "duplicate PV" refusing to activate. So for NBD we skip kpartx
-    entirely and use the devices qemu-nbd already made.
+    Why the fallback matters:
+      With max_part=0 in /etc/modprobe.d/nbd.conf (recommended to prevent
+      duplicate PV problems with LVM) the kernel does NOT auto-create
+      /dev/nbd0p1 etc. In that case we must use kpartx which creates
+      /dev/mapper/nbd0p1 instead — a different namespace so no LVM clash.
     """
     if dry_run:
-        return [f"{dev}p1_DRYRUN", f"{dev}p2_DRYRUN"]
+        return [f"/dev/mapper/{Path(dev).name}p1_DRYRUN",
+                f"/dev/mapper/{Path(dev).name}p2_DRYRUN"]
 
     if use_kpartx:
         return kpartx_add(dev, dry_run=False)
-    else:
-        # NBD: wait briefly for kernel to expose partition nodes, then read them
-        time.sleep(1)
-        dev_name = Path(dev).name  # nbd0
-        parts = sorted(glob.glob(f"/dev/{dev_name}p*"))
-        log.debug(f"  NBD partitions found: {parts}")
-        return parts
+
+    # NBD path: check for kernel-created partition nodes first
+    time.sleep(0.5)
+    dev_name = Path(dev).name  # e.g. nbd0
+    nbd_parts = sorted(glob.glob(f"/dev/{dev_name}p*"))
+
+    if nbd_parts:
+        # max_part > 0 — kernel created /dev/nbd0p1 etc, use them directly
+        log.debug(f"  NBD partitions (kernel): {nbd_parts}")
+        return nbd_parts
+
+    # max_part=0 — no kernel partition nodes, use kpartx instead
+    log.debug(f"  No /dev/{dev_name}p* found (max_part=0) — using kpartx")
+    return kpartx_add(dev, dry_run=False)
 
 
 # ── Mount all partitions on a block device ────────────────────────────────────
