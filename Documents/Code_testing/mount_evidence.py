@@ -442,33 +442,39 @@ def lvm_mount_lvs(mp_base: Path, part_label: str, readonly: bool,
 
 
 # ── dmsetup cleanup ───────────────────────────────────────────────────────────
-def dmsetup_remove_lvm(dry_run: bool):
+def dmsetup_remove_all(dry_run: bool):
     """
-    Remove device mapper entries that belong to LVM (not kpartx).
-    kpartx entries look like loopXpY or nbdXpY — leave those alone.
-    Everything else (LVM LVs) gets removed so block devices can detach.
+    Remove all /dev/mapper entries left after filesystem unmounts and NBD
+    disconnects. This mirrors the manual command that works:
+      dmsetup ls | grep -v "^control" | awk '{print $1}' |
+        while read name; do dmsetup remove "$name"; done
+
+    Called once at the end of unmount_all — not per-image — so it catches:
+      - LVM logical volumes from single-LVM VMDKs
+      - kpartx nbd0pX entries from multi-partition VMDKs (when max_part=0)
+      - Anything else left in device mapper
     """
     if not shutil.which("dmsetup"):
         return
     out = cmd_out(["dmsetup", "ls"])
     if not out:
         return
-    kpartx_pat = re.compile(r"^(loop|nbd)\d+p\d+$")
+
     entries = [
         cols[0] for line in out.splitlines()
         if (cols := line.split()) and cols[0] != "control"
-        and not kpartx_pat.match(cols[0])
     ]
+
     if not entries:
-        log.debug("  No LVM dm entries to remove")
+        log.debug("  No device mapper entries to remove")
         return
-    log.info(f"  Removing {len(entries)} LVM dm entries")
+
+    log.info(f"  Removing {len(entries)} device mapper entries")
     for name in entries:
         log.info(f"    dmsetup remove --force {name}")
         try:
             run(["dmsetup", "remove", "--force", name],
                 dry_run=dry_run, check=False, capture=True)
-            time.sleep(0.1)
         except Exception as e:
             log.warning(f"    {e}")
 
@@ -971,7 +977,6 @@ def unmount_all(mount_base: Path, dry_run: bool):
     state_files = sorted(mount_base.rglob(STATE_FILE), reverse=True)
 
     if not state_files:
-        # Fallback — no state files, do best-effort from /proc/mounts
         log.warning("No state files found — falling back to /proc/mounts")
         mounts = []
         try:
@@ -984,25 +989,21 @@ def unmount_all(mount_base: Path, dry_run: bool):
         for mp in sorted(mounts, reverse=True):
             _umount(mp, dry_run)
         lvm_deactivate(dry_run)
-        dmsetup_remove_lvm(dry_run)
+        dmsetup_remove_all(dry_run)
         return
 
+    # ── Per-image teardown ────────────────────────────────────────────────────
     for sf in state_files:
         state = MountState.load(str(sf.parent))
         if not state:
             continue
         log.info(f"\n── Teardown: {state.image_path}")
 
-        # 1. Unmount filesystems (deepest path first)
+        # 1. Unmount all filesystem mountpoints (deepest first)
         for mp in sorted(state.partitions, reverse=True):
             _umount(mp, dry_run)
 
-        # 2. Deactivate LVM and clean dm entries (only if LVM was used)
-        if state.lvm_volume_groups:
-            lvm_deactivate(dry_run)
-            dmsetup_remove_lvm(dry_run)
-
-        # 3. Release loop devices (kpartx then losetup)
+        # 2. Release loop devices — kpartx first, then losetup
         for dev in state.loop_devices:
             if not dry_run:
                 kpartx_remove(dev)
@@ -1010,17 +1011,31 @@ def unmount_all(mount_base: Path, dry_run: bool):
             else:
                 log.info(f"  [DRY-RUN] kpartx -d {dev} && losetup -d {dev}")
 
-        # 4. Disconnect NBD devices
+        # 3. Disconnect NBD devices
+        #    kpartx mappings for NBD (created when max_part=0) are cleaned up
+        #    in the final dmsetup pass below — we don't call kpartx -d per-device
+        #    here because qemu-nbd --disconnect already invalidates them
         for dev in state.nbd_devices:
             nbd_disconnect(dev, dry_run)
 
-        # 5. Unmount FUSE mounts (ewfmount/affuse) — must be last
+        # 4. Unmount FUSE mounts (ewfmount/affuse) — must be after loop detach
         for mp in state.fuse_mounts:
             _umount(mp, dry_run)
 
         if not dry_run:
             try: sf.unlink()
             except Exception: pass
+
+    # ── Final cleanup — runs once after all images are torn down ─────────────
+    # Deactivate any remaining LVM VGs (safe to run even if none were active)
+    log.info("\n── Final cleanup")
+    lvm_deactivate(dry_run)
+
+    # Remove ALL remaining /dev/mapper entries in one pass:
+    #   - LVM logical volumes left over from any image
+    #   - kpartx nbd mappings (nbd0p1 etc) from multi-partition VMDKs
+    #   - Anything else left behind
+    dmsetup_remove_all(dry_run)
 
     log.info("Cleaning empty directories...")
     if not dry_run:
