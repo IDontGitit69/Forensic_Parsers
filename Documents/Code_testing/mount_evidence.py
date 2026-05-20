@@ -108,7 +108,8 @@ FS_OPTS_RO: dict[str, list[list[str]]] = {
     "ext3":    [["-t","ext3","-o","ro,noatime,noload"],
                 ["-t","ext3","-o","ro,noatime"],
                 ["-t","ext2","-o","ro,noatime"]],
-    "ext4":    [["-t","ext4","-o","ro,noatime,noload"],
+    "ext4":    [["-t","ext4","-o","ro,noload"],          # always try noload first — works for LVM LVs
+                ["-t","ext4","-o","ro,noatime,noload"],
                 ["-t","ext4","-o","ro,noatime"],
                 ["-t","ext2","-o","ro,noatime"]],
     "xfs":     [["-t","xfs","-o","ro,noatime,norecovery"],
@@ -541,26 +542,23 @@ def nbd_connect(img: Path, readonly: bool, state: MountState, dry_run: bool) -> 
     return dev
 
 def nbd_disconnect(dev: str, dry_run: bool):
+    """
+    Disconnect a qemu-nbd device.
+    We do NOT poll waiting for the slot to be "confirmed free" — that loop was
+    the cause of the long hangs. By the time we call this, all filesystems on
+    the device have already been unmounted and LVM deactivated, so the device
+    is no longer held open. qemu-nbd --disconnect is sufficient; the kernel
+    releases the slot asynchronously but we don't need to wait for it.
+    """
     if dry_run:
         log.info(f"  [DRY-RUN] qemu-nbd --disconnect {dev}")
         return
     log.info(f"  Disconnecting NBD: {dev}")
     try:
         run(["qemu-nbd", "--disconnect", dev], check=False, capture=True, timeout=10)
+        log.info(f"  NBD {dev} disconnected")
     except Exception as e:
         log.warning(f"  qemu-nbd --disconnect {dev}: {e}")
-    # Poll until free
-    try:
-        idx = int(re.search(r"\d+$", dev).group())
-        deadline = time.monotonic() + NBD_TIMEOUT
-        while time.monotonic() < deadline:
-            if nbd_is_free(idx):
-                log.info(f"  NBD {dev} confirmed free")
-                return
-            time.sleep(NBD_POLL)
-        log.warning(f"  NBD {dev} still busy after {NBD_TIMEOUT}s")
-    except Exception:
-        pass
 
 
 # ── Partition discovery ───────────────────────────────────────────────────────
@@ -881,7 +879,6 @@ def unmount_all(mount_base: Path, dry_run: bool):
         for mp in sorted(mounts, reverse=True):
             _umount(mp, dry_run)
         lvm_deactivate(dry_run)
-        if not dry_run: time.sleep(0.5)
         dmsetup_remove_lvm(dry_run)
         return
 
@@ -891,23 +888,19 @@ def unmount_all(mount_base: Path, dry_run: bool):
             continue
         log.info(f"\n── Teardown: {state.image_path}")
 
-        # 1. Unmount filesystems (deepest first)
+        # 1. Unmount filesystems (deepest path first)
         for mp in sorted(state.partitions, reverse=True):
             _umount(mp, dry_run)
-        if not dry_run: time.sleep(0.5)
 
-        # 2. Deactivate LVM if used
+        # 2. Deactivate LVM and clean dm entries (only if LVM was used)
         if state.lvm_volume_groups:
             lvm_deactivate(dry_run)
-            if not dry_run: time.sleep(0.5)
             dmsetup_remove_lvm(dry_run)
-            if not dry_run: time.sleep(0.3)
 
         # 3. Release loop devices (kpartx then losetup)
         for dev in state.loop_devices:
             if not dry_run:
                 kpartx_remove(dev)
-                time.sleep(0.3)
                 losetup_detach(dev)
             else:
                 log.info(f"  [DRY-RUN] kpartx -d {dev} && losetup -d {dev}")
