@@ -1011,12 +1011,16 @@ def unmount_all(mount_base: Path, dry_run: bool):
             else:
                 log.info(f"  [DRY-RUN] kpartx -d {dev} && losetup -d {dev}")
 
-        # 3. Disconnect NBD devices
-        #    kpartx mappings for NBD (created when max_part=0) are cleaned up
-        #    in the final dmsetup pass below — we don't call kpartx -d per-device
-        #    here because qemu-nbd --disconnect already invalidates them
+        # 3. Release NBD devices — kpartx FIRST then disconnect
+        #    kpartx -d must happen before qemu-nbd --disconnect otherwise the
+        #    mapper entries hold the device open and the disconnect either fails
+        #    silently or leaves the last partition entry stuck in /dev/mapper
         for dev in state.nbd_devices:
-            nbd_disconnect(dev, dry_run)
+            if not dry_run:
+                kpartx_remove(dev)
+                nbd_disconnect(dev, dry_run)
+            else:
+                log.info(f"  [DRY-RUN] kpartx -d {dev} && qemu-nbd --disconnect {dev}")
 
         # 4. Unmount FUSE mounts (ewfmount/affuse) — must be after loop detach
         for mp in state.fuse_mounts:
