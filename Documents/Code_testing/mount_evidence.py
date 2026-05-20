@@ -322,66 +322,85 @@ def lvm_mapper_path(dev_path: str) -> str:
 
 def lvm_snapshot_active() -> set[str]:
     """
-    Return the set of /dev/mapper/<name> paths that are currently active.
-    Used to diff before/after vgchange -ay so we only mount newly appeared LVs.
+    Return the set of /dev/mapper/<name> paths currently active in device mapper,
+    excluding kpartx partition maps (loopXpY / nbdXpY).
     """
-    if not shutil.which("dmsetup"):
-        return set()
-    out = cmd_out(["dmsetup", "ls"])
     kpartx_pat = re.compile(r"^(loop|nbd)\d+p\d+$")
-    active = set()
-    for line in out.splitlines():
-        cols = line.split()
-        if cols and cols[0] != "control" and not kpartx_pat.match(cols[0]):
-            active.add(f"/dev/mapper/{cols[0]}")
+    active: set[str] = set()
+
+    # Read directly from /dev/mapper/ — more reliable than dmsetup ls
+    mapper_dir = Path("/dev/mapper")
+    if not mapper_dir.exists():
+        return active
+
+    for entry in mapper_dir.iterdir():
+        name = entry.name
+        if name == "control":
+            continue
+        if kpartx_pat.match(name):
+            continue
+        active.add(str(entry))
+
     return active
 
 def lvm_mount_new_lvs(mp_base: Path, part_label: str, readonly: bool,
                       state: MountState, dry_run: bool,
                       before: set[str]) -> int:
     """
-    Mount only the LVs that appeared in /dev/mapper AFTER vgchange -ay.
-    'before' is the snapshot taken just before vgchange -ay was called.
-    This avoids iterating over every already-mounted LV from prior VMDKs.
+    Mount only the /dev/mapper entries that appeared after vgchange -ay.
+    Polls up to 5 seconds for new entries to appear rather than fixed sleep.
     """
     if dry_run:
         new_mappers = ["/dev/mapper/ubuntu--vg-ubuntu--lv"]
     else:
-        time.sleep(1)  # let udev create the /dev/mapper symlinks
-        after = lvm_snapshot_active()
-        new_mappers = sorted(after - before)
+        log.debug(f"  LVM snapshot before: {sorted(before)}")
+
+        # Poll until new entries appear (udev can be slow creating /dev/mapper symlinks)
+        new_mappers = []
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            after = lvm_snapshot_active()
+            new_mappers = sorted(after - before)
+            if new_mappers:
+                break
+            time.sleep(0.3)
+
+        log.debug(f"  LVM snapshot after:  {sorted(lvm_snapshot_active())}")
+        log.info(f"  New /dev/mapper entries: {new_mappers}")
+
         if not new_mappers:
             log.warning("  No new LV devices appeared after vgchange -ay")
+            log.warning("  Check: ls /dev/mapper/ and lvs")
             return 0
 
-    log.info(f"  {len(new_mappers)} new logical volume(s) to mount")
     lvm_base = mp_base / f"{part_label}_lvm"
     lvm_base.mkdir(parents=True, exist_ok=True)
     mounted = 0
 
     for mapper_dev in new_mappers:
         fs = detect_fs(mapper_dev) if not dry_run else "ext4"
-        log.info(f"    {mapper_dev}  [{fs or 'unknown'}]")
+        log.info(f"    {mapper_dev}  fs={fs or '(unknown — will try ext4)'}")
 
         if fs in UNMOUNTABLE_FS:
             log.info(f"    Skipping — '{fs}' not mountable")
             continue
 
-        # Mount point named after the mapper entry  e.g. ubuntu--vg-ubuntu--lv
         lv_name = Path(mapper_dev).name
         lv_mp   = lvm_base / lv_name
         lv_mp.mkdir(parents=True, exist_ok=True)
 
-        # Always try ext4 ro,noload first — works for the majority of LVM LVs
-        # on seized Linux systems regardless of what blkid reports
+        # Try in this order:
+        #   1. ext4 ro,noload  — the command proven to work manually
+        #   2. auto-detect ro,noatime
+        #   3. bare mount
         success = False
-        for cmd in [
-            ["mount", "-t", "ext4", "-o", "ro,noload", mapper_dev, str(lv_mp)],
-            ["mount", "-o", "ro,noatime", mapper_dev, str(lv_mp)],
-            ["mount", mapper_dev, str(lv_mp)],
+        for attempt_cmd in [
+            ["mount", "-t", "ext4", "-o", "ro,noload",  mapper_dev, str(lv_mp)],
+            ["mount", "-o", "ro,noatime",                mapper_dev, str(lv_mp)],
+            ["mount",                                     mapper_dev, str(lv_mp)],
         ]:
             try:
-                run(cmd, dry_run=dry_run, check=True, capture=True)
+                run(attempt_cmd, dry_run=dry_run, check=True, capture=True)
                 log.info(f"    ✓ {mapper_dev} → {lv_mp}")
                 state.partitions.append(str(lv_mp))
                 state.lvm_volume_groups.append(mapper_dev)
@@ -392,7 +411,7 @@ def lvm_mount_new_lvs(mp_base: Path, part_label: str, readonly: bool,
                 log.debug(f"    attempt failed: {e}")
 
         if not success:
-            log.error(f"    ✗ Could not mount {mapper_dev}")
+            log.error(f"    ✗ Could not mount {mapper_dev} (fs={fs or 'unknown'})")
             try: lv_mp.rmdir()
             except Exception: pass
 
