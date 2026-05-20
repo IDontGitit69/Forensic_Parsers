@@ -984,54 +984,26 @@ def is_ewf_segment(ext: str) -> bool:
 
 def is_vmdk_descriptor(f: Path) -> bool:
     """
-    Return True if this .vmdk is a text descriptor file that should be skipped.
+    Return True if this .vmdk should be skipped during discovery.
 
-    VMware monolithic-flat pairs look like:
-        windows.vmdk          ← tiny text descriptor (~1KB), references the flat file
-        windows-flat.vmdk     ← actual disk data (gigabytes)
+    VMware monolithic-flat pairs:
+        windows.vmdk        ← text descriptor (~1KB), tells qemu-nbd where the data is
+        windows-flat.vmdk   ← raw data file (gigabytes)
 
-    We skip a .vmdk if ANY of these are true:
-      1. It ends with -flat.vmdk — it's the raw data file; qemu-nbd handles it
-         directly via the descriptor, so mounting the flat file separately is
-         redundant and produces a duplicate mount.
-      2. It's a text file (starts with "# Disk DescriptorFile" or "version=") —
-         it's a descriptor; qemu-nbd reads this automatically and finds the flat.
-      3. A corresponding -flat.vmdk exists in the same directory — this descriptor
-         should be skipped in favour of letting qemu-nbd use it to find the flat.
+    Rule: skip ONLY the -flat.vmdk when a matching descriptor exists alongside it.
+    Always mount the descriptor — qemu-nbd reads it and finds the flat file itself.
 
-    We only mount the descriptor .vmdk (non-flat, non-text) when there is NO
-    paired flat file — that means it's a self-contained sparse VMDK.
+    If no descriptor exists next to a flat file, mount the flat file directly.
     """
     if f.suffix.lower() != ".vmdk":
         return False
 
-    # Rule 1: flat data file — skip if a descriptor exists alongside it
-    # qemu-nbd reads the descriptor which points to the flat file automatically.
-    # If there's NO descriptor, the flat file is the only thing present and
-    # qemu-nbd can mount it directly — so don't skip it in that case.
+    # Only skip flat data files — never skip descriptors
     if f.stem.lower().endswith("-flat"):
-        descriptor = f.parent / f"{f.stem[:-5]}{f.suffix}"  # strip '-flat'
+        descriptor = f.parent / f"{f.stem[:-5]}{f.suffix}"  # windows-flat → windows
         if descriptor.exists():
-            log.debug(f"Skipping flat VMDK data file (descriptor present): {f.name}")
+            log.debug(f"Skipping flat VMDK (descriptor {descriptor.name} handles it): {f.name}")
             return True
-        # No descriptor — flat file is standalone, mount it directly
-        return False
-
-    # Rule 2: text descriptor — check first 64 bytes
-    try:
-        header = f.read_bytes()[:64]
-        if header.lstrip().startswith((b"# Disk DescriptorFile", b"version=")):
-            # Rule 3: only skip if the paired flat file actually exists
-            flat = f.parent / f"{f.stem}-flat{f.suffix}"
-            if flat.exists():
-                log.debug(f"Skipping VMDK descriptor (flat file exists): {f.name}")
-                return True
-            # Descriptor with no flat file — it points to an embedded extent,
-            # qemu-nbd can handle it directly, so still skip the descriptor
-            log.debug(f"Skipping VMDK descriptor (self-describing): {f.name}")
-            return True
-    except OSError:
-        pass
 
     return False
 
