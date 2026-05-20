@@ -234,7 +234,8 @@ def check_deps():
             sys.exit(1)
     for t, pkg in [("ewfmount","ewf-tools"), ("qemu-nbd","qemu-utils"),
                    ("affuse","afflib-tools"), ("ntfs-3g","ntfs-3g"),
-                   ("vgchange","lvm2"), ("dmsetup","dmsetup")]:
+                   ("vgchange","lvm2"), ("dmsetup","dmsetup"),
+                   ("vmfs6-fuse","vmfs6-fuse (copy to /usr/local/bin/)")]:
         if not shutil.which(t):
             log.warning(f"Optional tool '{t}' not found (apt install {pkg})")
 
@@ -284,6 +285,43 @@ def do_mount(dev: str, mp: Path, fs: str, readonly: bool, dry_run: bool) -> bool
 
     log.error(f"    ✗ All mount attempts failed for {dev} (fs={fs or 'unknown'})")
     return False
+
+
+# ── VMFS ──────────────────────────────────────────────────────────────────────
+
+def mount_vmfs_partition(part: str, mp: Path,
+                         state: MountState, dry_run: bool) -> bool:
+    """
+    Mount a VMFS volume using vmfs6-fuse.
+
+    Syntax: vmfs6-fuse <device> <mountpoint>
+
+    vmfs6-fuse is a FUSE driver — the mount point stays live as long as the
+    process runs. Tracked in state.fuse_mounts so teardown unmounts it with
+    umount -l like any other FUSE mount.
+
+    Note: vmfs6-fuse mounts are inherently read-only (the tool has no write
+    support) so we don't pass a readonly flag.
+    """
+    if not shutil.which("vmfs6-fuse"):
+        log.error("  vmfs6-fuse not found — copy binary to /usr/local/bin/vmfs6-fuse")
+        return False
+
+    mp.mkdir(parents=True, exist_ok=True)
+    log.info(f"    Mounting VMFS: {part} → {mp}")
+
+    try:
+        run(["vmfs6-fuse", part, str(mp)],
+            dry_run=dry_run, check=True, capture=True)
+        log.info(f"    ✓ VMFS mounted {part} → {mp}")
+        state.partitions.append(str(mp))
+        state.fuse_mounts.append(str(mp))
+        return True
+    except RuntimeError as e:
+        log.error(f"    ✗ vmfs6-fuse failed for {part}: {e}")
+        try: mp.rmdir()
+        except Exception: pass
+        return False
 
 
 # ── LVM ───────────────────────────────────────────────────────────────────────
@@ -731,6 +769,10 @@ def mount_partitions(blk_dev: str, mp_base: Path, readonly: bool,
             log.error(f"  LVM activation/mount failed for {blk_dev}")
             return 0
 
+        if fs == "vmfs_volume_member":
+            mp = mp_base / "volume"
+            return 1 if mount_vmfs_partition(blk_dev, mp, state, dry_run) else 0
+
         if fs in UNMOUNTABLE_FS:
             log.warning(f"  Skipping {blk_dev} — '{fs}' not mountable")
             return 0
@@ -766,6 +808,14 @@ def mount_partitions(blk_dev: str, mp_base: Path, readonly: bool,
                     mounted += n
                 else:
                     log.error(f"    vgchange -ay failed for {part}")
+                continue
+
+            # VMFS volume
+            if fs == "vmfs_volume_member":
+                log.info(f"    VMFS volume detected — using vmfs6-fuse")
+                mp = mp_base / part_label
+                if mount_vmfs_partition(part, mp, state, dry_run):
+                    mounted += 1
                 continue
 
             if fs in UNMOUNTABLE_FS:
