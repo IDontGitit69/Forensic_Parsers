@@ -324,13 +324,46 @@ def lvm_active_lvs() -> list[str]:
 
 def lvm_mount_lvs(mp_base: Path, part_label: str, readonly: bool,
                   state: MountState, dry_run: bool) -> int:
-    """Mount all active LVs under mp_base/<part_label>_lvm/<vg>/<lv>/"""
-    lv_devs = lvm_active_lvs() if not dry_run else ["/dev/ubuntu-vg/ubuntu-lv"]
-    if not lv_devs:
-        log.warning("  No active LVs found after vgchange -ay")
-        return 0
+    """
+    Mount LVs that were newly activated by vgchange -ay.
 
-    log.info(f"  Found {len(lv_devs)} logical volume(s)")
+    The key problem this solves: with 11 VMDKs each containing an LVM PV,
+    vgchange -ay on VMDK #7 activates ALL VGs seen so far — not just the new
+    one. lvm_active_lvs() would return LVs from VMDKs 1-7, and the first 6
+    are already mounted. Trying to mount them again fails silently and the
+    new one gets skipped.
+
+    Fix: snapshot active LVs BEFORE vgchange -ay, then only mount the ones
+    that appeared AFTER — those are the newly activated ones from this VMDK.
+    """
+    if dry_run:
+        lv_devs = ["/dev/ubuntu-vg/ubuntu-lv"]
+    else:
+        # Snapshot what was already active before we called vgchange -ay
+        # This is stored by the caller in state so we can diff against it
+        already_mounted = set(state.partitions)
+
+        lv_devs = lvm_active_lvs()
+        if not lv_devs:
+            log.warning("  No active LVs found after vgchange -ay")
+            return 0
+
+        # Filter to only LVs whose device path is NOT already mounted
+        new_lvs = []
+        for dev in lv_devs:
+            # Check if this device is already mounted anywhere
+            already = cmd_out(["findmnt", "-n", "-o", "TARGET", "--source", dev])
+            if already:
+                log.debug(f"    Skipping {dev} — already mounted at {already}")
+                continue
+            new_lvs.append(dev)
+
+        lv_devs = new_lvs
+        if not lv_devs:
+            log.warning("  All active LVs are already mounted — none new from this PV")
+            return 0
+
+    log.info(f"  Found {len(lv_devs)} new logical volume(s) to mount")
     lvm_base = mp_base / f"{part_label}_lvm"
     lvm_base.mkdir(parents=True, exist_ok=True)
     mounted = 0
@@ -342,7 +375,7 @@ def lvm_mount_lvs(mp_base: Path, part_label: str, readonly: bool,
             continue
 
         # /dev/ubuntu-vg/ubuntu-lv  →  lvm_base/ubuntu-vg/ubuntu-lv/
-        rel  = Path(lv_dev).relative_to("/dev")
+        rel   = Path(lv_dev).relative_to("/dev")
         lv_mp = lvm_base / rel
         lv_mp.mkdir(parents=True, exist_ok=True)
 
