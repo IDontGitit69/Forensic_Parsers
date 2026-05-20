@@ -984,52 +984,33 @@ def is_ewf_segment(ext: str) -> bool:
 
 def is_vmdk_flat_data_file(f: Path) -> bool:
     """
-    Return True if this .vmdk is a raw flat data file that should be skipped.
-
-    VMware disk images come in two forms:
-      - Sparse VMDK   : starts with magic bytes KDMV (0x4B 0x44 0x4D 0x56)
-                        or is a text descriptor file. qemu-nbd handles both.
-      - Flat VMDK     : raw sector data, no header — just starts with the MBR
-                        or GPT of the disk. Mounting this directly while also
-                        mounting the descriptor gives a duplicate mount.
-
-    Detection: read the first 4 bytes.
-      - Starts with KDMV  → sparse VMDK  → mount it
-      - Starts with text  → descriptor   → mount it (qemu-nbd follows to flat)
-      - Anything else     → raw flat data → skip it IF a paired descriptor exists
-
-    This is the most reliable approach — no filename convention assumptions.
+    Skip raw flat VMDK data files when a paired descriptor/sparse VMDK exists.
+    Reads only 4 bytes from each file to check the KDMV sparse magic header.
+    Flat files have no header — they start with raw disk data (MBR/GPT).
     """
     if f.suffix.lower() != ".vmdk":
         return False
 
-    try:
-        header = f.read_bytes()[:4]
-    except OSError:
-        return False
-
-    # KDMV magic = sparse/hosted VMDK — always mount
-    if header == b"KDMV":
-        return False
-
-    # Text file = descriptor — always mount
-    if header[:1] in (b"#", b"v", b"e", b"d"):  # version=, encoding=, ddb., #
-        return False
-
-    # Raw data (no recognisable header) — skip if a descriptor or sparse VMDK
-    # exists in the same directory that covers this disk
-    siblings = list(f.parent.glob("*.vmdk"))
-    for sibling in siblings:
-        if sibling == f:
-            continue
+    def read_header(path: Path) -> bytes:
         try:
-            sib_header = sibling.read_bytes()[:4]
-            # If any sibling is a sparse VMDK or descriptor, this flat is covered
-            if sib_header == b"KDMV" or sib_header[:1] in (b"#", b"v", b"e", b"d"):
-                log.debug(f"Skipping flat VMDK data file (covered by {sibling.name}): {f.name}")
-                return True
+            with path.open("rb") as fh:
+                return fh.read(4)
         except OSError:
-            continue
+            return b""
+
+    def is_sparse_or_descriptor(path: Path) -> bool:
+        h = read_header(path)
+        return h == b"KDMV" or h[:1] in (b"#", b"v", b"e", b"d")
+
+    # If this file itself is a sparse VMDK or descriptor, always mount it
+    if is_sparse_or_descriptor(f):
+        return False
+
+    # It's a raw flat file — skip it if any sibling VMDK covers it
+    for sibling in f.parent.glob("*.vmdk"):
+        if sibling != f and is_sparse_or_descriptor(sibling):
+            log.debug(f"Skipping flat VMDK {f.name} — covered by {sibling.name}")
+            return True
 
     return False
 
