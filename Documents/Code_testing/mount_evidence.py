@@ -311,17 +311,28 @@ def mount_vmfs_partition(part: str, mp: Path,
     log.info(f"    Mounting VMFS: {part} → {mp}")
 
     try:
-        run(["vmfs6-fuse", part, str(mp)],
+        run(["vmfs6-fuse", "-o", "allow_other", part, str(mp)],
             dry_run=dry_run, check=True, capture=True)
         log.info(f"    ✓ VMFS mounted {part} → {mp}")
         state.partitions.append(str(mp))
         state.fuse_mounts.append(str(mp))
         return True
-    except RuntimeError as e:
-        log.error(f"    ✗ vmfs6-fuse failed for {part}: {e}")
-        try: mp.rmdir()
-        except Exception: pass
-        return False
+    except RuntimeError:
+        # allow_other requires user_allow_other in /etc/fuse.conf — try without
+        log.warning(f"    allow_other failed — retrying without (GUI browsing may not work)")
+        log.warning(f"    To fix: add 'user_allow_other' to /etc/fuse.conf")
+        try:
+            run(["vmfs6-fuse", part, str(mp)],
+                dry_run=dry_run, check=True, capture=True)
+            log.info(f"    ✓ VMFS mounted {part} → {mp}")
+            state.partitions.append(str(mp))
+            state.fuse_mounts.append(str(mp))
+            return True
+        except RuntimeError as e:
+            log.error(f"    ✗ vmfs6-fuse failed for {part}: {e}")
+            try: mp.rmdir()
+            except Exception: pass
+            return False
 
 
 # ── LVM ───────────────────────────────────────────────────────────────────────
@@ -990,7 +1001,7 @@ def process_image(img: Path, hostname: str, label: str,
         try:
             if mp_base.exists() and not any(mp_base.iterdir()):
                 mp_base.rmdir()
-        except Exception:
+        except OSError:
             pass
     return ok
 
@@ -1029,8 +1040,11 @@ def discover(evidence_root: Path) -> list[tuple[Path, str, str]]:
 
 # ── Unmount ───────────────────────────────────────────────────────────────────
 def _umount(mp: str, dry_run: bool):
-    if not dry_run and not Path(mp).exists():
-        return
+    try:
+        if not dry_run and not Path(mp).exists():
+            return
+    except OSError:
+        pass  # corrupt filesystem — attempt umount anyway
     try:
         run(["umount", "-l", mp], dry_run=dry_run, check=True, capture=True)
         log.info(f"  Unmounted: {mp}")
@@ -1118,14 +1132,16 @@ def unmount_all(mount_base: Path, dry_run: bool):
 
     log.info("Cleaning empty directories...")
     if not dry_run:
-        for dirpath, _, _ in os.walk(str(mount_base), topdown=False):
+        def _ignore_oserror(e): pass
+        for dirpath, _, _ in os.walk(str(mount_base), topdown=False,
+                                      onerror=_ignore_oserror):
             p = Path(dirpath)
             if p == mount_base: continue
             try:
                 if not any(p.iterdir()):
                     p.rmdir()
-            except Exception:
-                pass
+            except OSError:
+                pass  # corrupt filesystem or busy mount — skip silently
 
     banner("Unmount complete")
 
@@ -1159,13 +1175,16 @@ def _tree(path: Path, prefix="  ", depth=0, max_depth=4):
     if depth >= max_depth: return
     try:
         entries = sorted(e for e in path.iterdir() if not e.name.startswith("."))
-    except PermissionError:
+    except (PermissionError, OSError):
         return
     for i, e in enumerate(entries):
         last = i == len(entries) - 1
         print(f"{prefix}{'└── ' if last else '├── '}{e.name}")
         if e.is_dir():
-            _tree(e, prefix + ("    " if last else "│   "), depth+1, max_depth)
+            try:
+                _tree(e, prefix + ("    " if last else "│   "), depth+1, max_depth)
+            except OSError:
+                print(f"{prefix}    {'    ' if last else '│   '}[IO error — corrupt data]")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
