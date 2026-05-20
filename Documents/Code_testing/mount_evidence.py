@@ -1057,7 +1057,14 @@ def unmount_all(mount_base: Path, dry_run: bool):
         log.warning(f"{mount_base} does not exist")
         return
 
-    state_files = sorted(mount_base.rglob(STATE_FILE), reverse=True)
+    # State files are always at exactly: mount_base/<hostname>/<image_label>/.mount_state.json
+    # We use a fixed 2-level glob instead of rglob to avoid walking into mounted
+    # filesystem contents — rglob recurses into mounted partitions and throws
+    # OSError on corrupt Windows images (e.g. corrupt NTFS directories).
+    state_files = sorted(
+        mount_base.glob(f"*/*/{STATE_FILE}"),
+        reverse=True
+    )
 
     if not state_files:
         log.warning("No state files found — falling back to /proc/mounts")
