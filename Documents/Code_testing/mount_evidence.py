@@ -686,9 +686,28 @@ def mount_partitions(blk_dev: str, mp_base: Path, readonly: bool,
     parts = get_partitions_for(blk_dev, use_kpartx, dry_run)
 
     if not parts:
-        # No partition table — try mounting device directly
-        log.warning(f"  No partitions found on {blk_dev} — trying direct mount")
+        # No partition table — the whole device might be a raw filesystem
+        # OR an LVM PV with no partition table (common in VMDKs)
         fs = detect_fs(blk_dev) if not dry_run else "ext4"
+        log.info(f"  No partitions found on {blk_dev} — detected: {fs or 'unknown'}")
+
+        if fs == "lvm2_member":
+            # Whole device is an LVM PV — activate and mount LVs
+            log.info(f"  Whole device is LVM PV — running vgchange -ay")
+            if lvm_activate(dry_run):
+                time.sleep(1)
+                n = lvm_mount_lvs(mp_base, "volume", readonly, state, dry_run)
+                if n > 0:
+                    return n
+            log.error(f"  LVM activation/mount failed for {blk_dev}")
+            return 0
+
+        if fs in UNMOUNTABLE_FS:
+            log.warning(f"  Skipping {blk_dev} — '{fs}' not mountable")
+            return 0
+
+        # Try as a plain filesystem
+        log.info(f"  Attempting direct mount of {blk_dev}")
         mp = mp_base / "volume"
         mp.mkdir(parents=True, exist_ok=True)
         if do_mount(blk_dev, mp, fs, readonly, dry_run):
