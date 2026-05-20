@@ -444,39 +444,58 @@ def lvm_mount_lvs(mp_base: Path, part_label: str, readonly: bool,
 # ── dmsetup cleanup ───────────────────────────────────────────────────────────
 def dmsetup_remove_all(dry_run: bool):
     """
-    Remove all /dev/mapper entries left after filesystem unmounts and NBD
-    disconnects. This mirrors the manual command that works:
-      dmsetup ls | grep -v "^control" | awk '{print $1}' |
-        while read name; do dmsetup remove "$name"; done
-
-    Called once at the end of unmount_all — not per-image — so it catches:
-      - LVM logical volumes from single-LVM VMDKs
-      - kpartx nbd0pX entries from multi-partition VMDKs (when max_part=0)
-      - Anything else left in device mapper
+    Remove all /dev/mapper entries. Retries up to 3 times for busy entries
+    and logs the actual error message so we can see what's still holding on.
     """
     if not shutil.which("dmsetup"):
         return
-    out = cmd_out(["dmsetup", "ls"])
-    if not out:
+
+    if dry_run:
+        log.info("  [DRY-RUN] dmsetup remove --force <all entries>")
         return
 
-    entries = [
-        cols[0] for line in out.splitlines()
-        if (cols := line.split()) and cols[0] != "control"
-    ]
+    for attempt in range(1, 4):
+        out = cmd_out(["dmsetup", "ls"])
+        if not out:
+            return
 
-    if not entries:
-        log.debug("  No device mapper entries to remove")
-        return
+        entries = [
+            cols[0] for line in out.splitlines()
+            if (cols := line.split()) and cols[0] != "control"
+        ]
 
-    log.info(f"  Removing {len(entries)} device mapper entries")
-    for name in entries:
-        log.info(f"    dmsetup remove --force {name}")
-        try:
-            run(["dmsetup", "remove", "--force", name],
-                dry_run=dry_run, check=False, capture=True)
-        except Exception as e:
-            log.warning(f"    {e}")
+        if not entries:
+            log.debug("  No device mapper entries remaining")
+            return
+
+        log.info(f"  dmsetup pass {attempt}/3: {len(entries)} entries → {entries}")
+
+        for name in entries:
+            result = subprocess.run(
+                ["dmsetup", "remove", "--force", name],
+                capture_output=True, text=True
+            )
+            if result.returncode == 0:
+                log.info(f"    Removed: {name}")
+            else:
+                log.warning(f"    Could not remove {name}: {result.stderr.strip()}")
+
+        # Check what survived
+        remaining = [
+            cols[0] for line in cmd_out(["dmsetup", "ls"]).splitlines()
+            if (cols := line.split()) and cols[0] != "control"
+        ]
+        if not remaining:
+            log.info("  All device mapper entries removed")
+            return
+
+        log.warning(f"  {len(remaining)} still present after pass {attempt}: {remaining}")
+        if attempt < 3:
+            time.sleep(1)
+
+    log.error("  Some /dev/mapper entries could not be removed.")
+    log.error("  Manual cleanup: sudo dmsetup ls | grep -v '^control' | "
+              "awk '{print $1}' | while read n; do sudo dmsetup remove --force \"$n\"; done")
 
 
 # ── kpartx ────────────────────────────────────────────────────────────────────
@@ -1031,14 +1050,20 @@ def unmount_all(mount_base: Path, dry_run: bool):
             except Exception: pass
 
     # ── Final cleanup — runs once after all images are torn down ─────────────
-    # Deactivate any remaining LVM VGs (safe to run even if none were active)
     log.info("\n── Final cleanup")
-    lvm_deactivate(dry_run)
 
-    # Remove ALL remaining /dev/mapper entries in one pass:
-    #   - LVM logical volumes left over from any image
-    #   - kpartx nbd mappings (nbd0p1 etc) from multi-partition VMDKs
-    #   - Anything else left behind
+    if not dry_run:
+        # Log exactly what's left in /dev/mapper so we can diagnose stragglers
+        mapper_remaining = [
+            e.name for e in Path("/dev/mapper").iterdir()
+            if e.name != "control"
+        ] if Path("/dev/mapper").exists() else []
+        if mapper_remaining:
+            log.info(f"  /dev/mapper entries remaining: {sorted(mapper_remaining)}")
+        else:
+            log.info("  /dev/mapper is clean")
+
+    lvm_deactivate(dry_run)
     dmsetup_remove_all(dry_run)
 
     log.info("Cleaning empty directories...")
