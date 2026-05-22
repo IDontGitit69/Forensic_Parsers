@@ -1,0 +1,77 @@
+{
+  "scan_metadata": {
+    "scan_id": "yara-scan-20260521-084231",
+    "timestamp": "2026-05-21T08:42:31.447Z",
+    "scanner_version": "4.3.2",
+    "scan_duration_ms": 1342,
+    "host": "WORKSTATION-7A4F",
+    "triggered_by": "scheduled_task",
+    "rules_file": "/etc/yara/rules/mal_generic.yar",
+    "total_files_scanned": 4821
+  },
+  "matches": [
+    {
+      "rule_name": "Trojan_Generic_Dropper",
+      "rule_namespace": "malware.dropper",
+      "severity": "high",
+      "file_path": "C:\\Users\\jsmith\\AppData\\Local\\Temp\\svchost32.exe",
+      "file_size_bytes": 204800,
+      "file_hash_md5": "a3f5c12e9b4d67081ef230a94bc71d55",
+      "file_hash_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "matched_strings": [
+        { "identifier": "$dropper_payload", "offset": 4096, "data": "4d5a9000030000000" },
+        { "identifier": "$reg_persistence", "offset": 8192, "data": "53 6f 66 74 77 61 72 65 5c 4d 69 63 72 6f 73 6f" }
+      ],
+      "tags": ["dropper", "persistence", "registry"],
+      "action_taken": "quarantined",
+      "quarantine_path": "C:\\ProgramData\\SecurityTool\\Quarantine\\svchost32.exe.quar"
+    },
+    {
+      "rule_name": "Suspicious_PowerShell_Download",
+      "rule_namespace": "behavior.ps1",
+      "severity": "medium",
+      "file_path": "C:\\Windows\\Temp\\update_helper.ps1",
+      "file_size_bytes": 3072,
+      "file_hash_md5": "7c4a8d09ca3762af61e59520943dc264",
+      "file_hash_sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+      "matched_strings": [
+        { "identifier": "$iex_download", "offset": 128, "data": "49 45 58 20 28 4e 65 77 2d 4f 62" },
+        { "identifier": "$base64_encoded", "offset": 256, "data": "46 72 6f 6d 42 61 73 65 36 34 53 74 72 69 6e 67" }
+      ],
+      "tags": ["powershell", "download", "obfuscation"],
+      "action_taken": "alerted",
+      "quarantine_path": null
+    },
+    {
+      "rule_name": "PUP_Adware_Injector",
+      "rule_namespace": "pup.adware",
+      "severity": "low",
+      "file_path": "C:\\Program Files (x86)\\FreeConverter\\converter_helper.dll",
+      "file_size_bytes": 512000,
+      "file_hash_md5": "1e4a1b03d1b6cd8a174a8d7a3f5c9e22",
+      "file_hash_sha256": "b94f6f125c79e3a5ffaa826f584c10d52ada669e6762051b826b55776d05a8ab",
+      "matched_strings": [
+        { "identifier": "$ad_inject_sig", "offset": 16384, "data": "68 74 74 70 3a 2f 2f 61 64 73 65 72 76 65" }
+      ],
+      "tags": ["adware", "pup", "dll-injection"],
+      "action_taken": "flagged",
+      "quarantine_path": null
+    }
+  ],
+  "summary": {
+    "total_matches": 3,
+    "by_severity": {
+      "critical": 0,
+      "high": 1,
+      "medium": 1,
+      "low": 1
+    },
+    "actions_taken": {
+      "quarantined": 1,
+      "alerted": 1,
+      "flagged": 1,
+      "allowed": 0
+    },
+    "scan_status": "completed_with_findings"
+  }
+}
