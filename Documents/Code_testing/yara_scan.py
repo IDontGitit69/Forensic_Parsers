@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
-YARA scanner with pigz and zip decompression support for compressed log files.
+YARA scanner with in-memory decompression for .gz/.tgz (via pigz) and .zip files.
+Compressed files are never written to disk — decompressed bytes are scanned directly
+in memory, which avoids temp-file I/O overhead.
 
 Usage:
     python yara_scan.py --rules /etc/yara/rules/ --path /var/log/ --output ./results.json
@@ -11,7 +13,7 @@ Usage:
 Dependencies:
     pip install yara-python
     apt install pigz   (or yum install pigz)
-    zipfile is part of Python stdlib, no install needed
+    zipfile + gzip are Python stdlib, no install needed
 """
 
 import argparse
@@ -20,7 +22,6 @@ import logging
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 import zipfile
 from pathlib import Path
@@ -34,14 +35,12 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# Extensions handled by pigz
 PIGZ_EXTENSIONS = {".gz", ".tgz", ".pigz"}
-# Extensions handled by Python's zipfile module
-ZIP_EXTENSIONS = {".zip"}
+ZIP_EXTENSIONS  = {".zip"}
 
 
 # ---------------------------------------------------------------------------
-# Decompression helpers
+# Decompression — returns raw bytes, nothing touches disk
 # ---------------------------------------------------------------------------
 
 def check_pigz():
@@ -51,61 +50,53 @@ def check_pigz():
         sys.exit(1)
 
 
-def decompress_with_pigz(compressed_path: Path, dest_dir: str) -> Path:
+def decompress_pigz_to_bytes(compressed_path: Path) -> bytes:
     """
-    Decompress a .gz/.tgz file using pigz into dest_dir.
-    Returns the path to the decompressed file.
+    Stream a .gz/.tgz file through pigz and return the decompressed bytes.
+    Nothing is written to disk.
     """
-    stem = compressed_path.stem  # "syslog" from "syslog.gz"
-    dest_path = Path(dest_dir) / stem
-
-    log.info("  Decompressing with pigz: %s -> %s", compressed_path.name, dest_path.name)
+    log.info("  Decompressing in memory (pigz): %s", compressed_path.name)
     try:
-        with open(dest_path, "wb") as out_f:
-            subprocess.run(
-                ["pigz", "-d", "-c", str(compressed_path)],
-                stdout=out_f,
-                stderr=subprocess.PIPE,
-                check=True,
-            )
+        result = subprocess.run(
+            ["pigz", "-d", "-c", str(compressed_path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+        return result.stdout
     except subprocess.CalledProcessError as exc:
         raise RuntimeError(
             f"pigz failed on {compressed_path}: {exc.stderr.decode().strip()}"
         ) from exc
 
-    return dest_path
 
-
-def extract_zip(zip_path: Path, dest_dir: str) -> list:
+def read_zip_entries_to_bytes(zip_path: Path) -> list:
     """
-    Extract all files from a zip archive into dest_dir.
-    Returns a list of Paths to the extracted files.
-    Skips encrypted entries and directories.
+    Read all files inside a zip into memory.
+    Returns a list of (entry_name, bytes) tuples.
+    Skips directories and encrypted entries.
     """
-    extracted = []
-    log.info("  Extracting zip: %s", zip_path.name)
+    entries = []
+    log.info("  Reading zip in memory: %s", zip_path.name)
 
     try:
         with zipfile.ZipFile(zip_path, "r") as zf:
             for info in zf.infolist():
-                # Skip directories
                 if info.is_dir():
                     continue
-                # Warn and skip encrypted entries
                 if info.flag_bits & 0x1:
                     log.warning("  Skipping encrypted entry (no password support): %s", info.filename)
                     continue
                 try:
-                    out_path = zf.extract(info, path=dest_dir)
-                    extracted.append(Path(out_path))
-                    log.info("    Extracted: %s", info.filename)
+                    data = zf.read(info.filename)
+                    entries.append((info.filename, data))
+                    log.info("    Read into memory: %s (%d bytes)", info.filename, len(data))
                 except Exception as exc:
-                    log.warning("    Could not extract %s: %s", info.filename, exc)
+                    log.warning("    Could not read %s: %s", info.filename, exc)
     except zipfile.BadZipFile as exc:
         raise RuntimeError(f"Bad zip file {zip_path}: {exc}") from exc
 
-    log.info("  %d file(s) extracted from %s", len(extracted), zip_path.name)
-    return extracted
+    return entries
 
 
 # ---------------------------------------------------------------------------
@@ -131,8 +122,22 @@ def load_rules(rules_path: str) -> yara.Rules:
         sys.exit(1)
 
 
-def scan_file(rules: yara.Rules, file_path: Path) -> list:
-    """Scan a single file with YARA. Returns a list of match dicts."""
+def scan_bytes(rules: yara.Rules, data: bytes, label: str) -> list:
+    """Scan raw bytes with YARA. Returns a list of match dicts."""
+    try:
+        matches = rules.match(data=data, timeout=60)
+    except yara.TimeoutError:
+        log.warning("  YARA timed out scanning: %s", label)
+        return []
+    except yara.Error as exc:
+        log.warning("  YARA error scanning %s: %s", label, exc)
+        return []
+
+    return _format_matches(matches)
+
+
+def scan_path(rules: yara.Rules, file_path: Path) -> list:
+    """Scan a file on disk with YARA (used for plain uncompressed files). Returns a list of match dicts."""
     try:
         matches = rules.match(str(file_path), timeout=60)
     except yara.TimeoutError:
@@ -142,6 +147,11 @@ def scan_file(rules: yara.Rules, file_path: Path) -> list:
         log.warning("  YARA error scanning %s: %s", file_path.name, exc)
         return []
 
+    return _format_matches(matches)
+
+
+def _format_matches(matches) -> list:
+    """Convert yara match objects into serialisable dicts."""
     results = []
     for match in matches:
         hit = {
@@ -163,7 +173,6 @@ def scan_file(rules: yara.Rules, file_path: Path) -> list:
                 ],
             })
         results.append(hit)
-
     return results
 
 
@@ -183,135 +192,112 @@ def collect_files(scan_path: Path) -> list:
 
 
 # ---------------------------------------------------------------------------
-# Main scan routine
+# Per-file dispatch
 # ---------------------------------------------------------------------------
 
-def process_file(rules, file_path, tmp_dir, scan_results, files_scanned, files_skipped):
+def process_file(rules, file_path, scan_results, files_scanned, files_skipped):
     """
-    Handle a single file: decompress if needed, scan with YARA, append results.
-    Returns updated (files_scanned, files_skipped) counts.
+    Dispatch a single file to the right handler based on extension.
+    Compressed files are decompressed fully in memory before scanning.
+    Returns updated (files_scanned, files_skipped).
     """
     suffix = file_path.suffix.lower()
-    stat = file_path.stat()
+    stat   = file_path.stat()
 
-    # --- ZIP ---
+    def make_entry(original, label, compressed, ctype, matches):
+        return {
+            "original_file":    str(original),
+            "scanned_label":    label,
+            "was_compressed":   compressed,
+            "compression_type": ctype,
+            "file_size_bytes":  stat.st_size,
+            "scan_timestamp":   time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "match_count":      len(matches),
+            "matches":          matches,
+        }
+
+    # --- ZIP (in-memory) ---
     if suffix in ZIP_EXTENSIONS:
         try:
-            extracted_files = extract_zip(file_path, tmp_dir)
+            entries = read_zip_entries_to_bytes(file_path)
         except RuntimeError as exc:
-            log.error("  Skipping zip — extraction failed: %s", exc)
+            log.error("  Skipping zip — could not read: %s", exc)
             return files_scanned, files_skipped + 1
 
-        if not extracted_files:
-            log.warning("  Zip contained no scannable files: %s", file_path.name)
+        if not entries:
+            log.warning("  Zip had no scannable entries: %s", file_path.name)
             return files_scanned, files_skipped + 1
 
-        for extracted in extracted_files:
-            matches = scan_file(rules, extracted)
+        for entry_name, data in entries:
+            matches = scan_bytes(rules, data, entry_name)
             files_scanned += 1
-            scan_results.append({
-                "original_file": str(file_path),
-                "zip_entry": extracted.name,
-                "scanned_file": str(extracted),
-                "was_compressed": True,
-                "compression_type": "zip",
-                "file_size_bytes": stat.st_size,
-                "scan_timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "match_count": len(matches),
-                "matches": matches,
-            })
-            if matches:
-                log.info("  [%s] WARNING %d match(es) found.", extracted.name, len(matches))
-            else:
-                log.info("  [%s] No matches.", extracted.name)
+            entry = make_entry(file_path, f"{file_path.name}::{entry_name}", True, "zip", matches)
+            entry["zip_entry"] = entry_name
+            scan_results.append(entry)
+            _log_result(entry_name, matches)
 
         return files_scanned, files_skipped
 
-    # --- PIGZ (.gz / .tgz) ---
+    # --- PIGZ .gz/.tgz (in-memory) ---
     if suffix in PIGZ_EXTENSIONS:
         try:
-            scan_target = decompress_with_pigz(file_path, tmp_dir)
+            data = decompress_pigz_to_bytes(file_path)
         except RuntimeError as exc:
-            log.error("  Skipping — pigz decompression failed: %s", exc)
+            log.error("  Skipping — pigz failed: %s", exc)
             return files_scanned, files_skipped + 1
 
-        matches = scan_file(rules, scan_target)
+        matches = scan_bytes(rules, data, file_path.name)
         files_scanned += 1
-        scan_results.append({
-            "original_file": str(file_path),
-            "scanned_file": str(scan_target),
-            "was_compressed": True,
-            "compression_type": "pigz",
-            "file_size_bytes": stat.st_size,
-            "scan_timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "match_count": len(matches),
-            "matches": matches,
-        })
-        if matches:
-            log.info("  WARNING %d match(es) found.", len(matches))
-        else:
-            log.info("  No matches.")
-
+        scan_results.append(make_entry(file_path, file_path.stem, True, "pigz", matches))
+        _log_result(file_path.name, matches)
         return files_scanned, files_skipped
 
-    # --- Plain file ---
-    matches = scan_file(rules, file_path)
+    # --- Plain file (read from disk normally) ---
+    matches = scan_path(rules, file_path)
     files_scanned += 1
-    scan_results.append({
-        "original_file": str(file_path),
-        "scanned_file": str(file_path),
-        "was_compressed": False,
-        "compression_type": None,
-        "file_size_bytes": stat.st_size,
-        "scan_timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "match_count": len(matches),
-        "matches": matches,
-    })
-    if matches:
-        log.info("  WARNING %d match(es) found.", len(matches))
-    else:
-        log.info("  No matches.")
-
+    scan_results.append(make_entry(file_path, file_path.name, False, None, matches))
+    _log_result(file_path.name, matches)
     return files_scanned, files_skipped
 
 
-def run_scan(rules_path, scan_path, output_file, keep_decompressed=False):
+def _log_result(label, matches):
+    if matches:
+        log.info("  [%s] WARNING %d match(es) found.", label, len(matches))
+    else:
+        log.info("  [%s] No matches.", label)
+
+
+# ---------------------------------------------------------------------------
+# Main scan routine
+# ---------------------------------------------------------------------------
+
+def run_scan(rules_path, scan_path, output_file):
     check_pigz()
     rules = load_rules(rules_path)
 
     all_files = collect_files(Path(scan_path))
     log.info("Found %d file(s) to process under '%s'.", len(all_files), scan_path)
 
-    scan_results = []
+    scan_results  = []
     files_scanned = 0
     files_skipped = 0
 
-    tmp_dir = tempfile.mkdtemp(prefix="yara_scan_")
-    log.info("Temp dir for decompressed files: %s", tmp_dir)
-
-    try:
-        for i, file_path in enumerate(sorted(all_files), start=1):
-            log.info("[%d/%d] %s", i, len(all_files), file_path)
-            files_scanned, files_skipped = process_file(
-                rules, file_path, tmp_dir, scan_results, files_scanned, files_skipped
-            )
-    finally:
-        if keep_decompressed:
-            log.info("Decompressed/extracted files retained at: %s", tmp_dir)
-        else:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-            log.info("Temp files cleaned up.")
+    for i, file_path in enumerate(sorted(all_files), start=1):
+        log.info("[%d/%d] %s", i, len(all_files), file_path)
+        files_scanned, files_skipped = process_file(
+            rules, file_path, scan_results, files_scanned, files_skipped
+        )
 
     total_matches = sum(r["match_count"] for r in scan_results)
     output = {
         "scan_metadata": {
-            "scan_id": f"yara-scan-{time.strftime('%Y%m%d-%H%M%S')}",
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "rules_path": str(rules_path),
-            "scan_path": str(scan_path),
-            "files_scanned": files_scanned,
-            "files_skipped": files_skipped,
-            "total_matches": total_matches,
+            "scan_id":        f"yara-scan-{time.strftime('%Y%m%d-%H%M%S')}",
+            "timestamp":      time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "rules_path":     str(rules_path),
+            "scan_path":      str(scan_path),
+            "files_scanned":  files_scanned,
+            "files_skipped":  files_skipped,
+            "total_matches":  total_matches,
         },
         "results": scan_results,
     }
@@ -330,23 +316,20 @@ def run_scan(rules_path, scan_path, output_file, keep_decompressed=False):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="YARA scanner with pigz and zip decompression for compressed log files."
+        description="YARA scanner with in-memory decompression for .gz/.tgz and .zip files."
     )
     parser.add_argument("--rules",  required=True,
                         help="Path to a .yar rule file or directory of rule files")
     parser.add_argument("--path",   required=True,
-                        help="File or directory to scan (supports .gz, .tgz, .zip)")
+                        help="File or directory to scan (supports .gz, .tgz, .zip, and plain files)")
     parser.add_argument("--output", required=True,
                         help="Path to write JSON results (e.g. ./results.json)")
-    parser.add_argument("--keep-decompressed", action="store_true",
-                        help="Keep decompressed/extracted temp files after scan")
     args = parser.parse_args()
 
     run_scan(
         rules_path=args.rules,
         scan_path=args.path,
         output_file=args.output,
-        keep_decompressed=args.keep_decompressed,
     )
 
 
