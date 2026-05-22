@@ -349,14 +349,48 @@ def lvm_activate(dry_run: bool) -> bool:
         log.error(f"  vgchange -ay failed: {e}")
         return False
 
-def lvm_deactivate(dry_run: bool):
+def lvm_deactivate(dry_run: bool, lv_devices: list[str] = None):
+    """
+    Deactivate only the VGs that the script activated from evidence images.
+
+    lv_devices is the list of /dev/mapper/<name> paths from state.lvm_volume_groups.
+    We extract the VG name from each path and deactivate only those VGs.
+
+    NEVER runs vgchange -an globally — that would deactivate the host OS root
+    LVM volume and crash the system if it's booted from LVM.
+    """
     if not shutil.which("vgchange"):
         return
-    try:
-        run(["vgchange", "-an"], dry_run=dry_run, check=False, capture=True)
-        log.info("  LVM: vgchange -an")
-    except Exception as e:
-        log.warning(f"  vgchange -an: {e}")
+
+    if not lv_devices:
+        log.debug("  No evidence LVM volumes to deactivate")
+        return
+
+    # Extract unique VG names from /dev/mapper/<vg>-<lv> paths
+    # LVM double-dash escaping: ubuntu--vg-ubuntu--lv → VG is ubuntu-vg
+    # We get VG names from lvs which gives us the canonical names
+    vgs_to_deactivate: set[str] = set()
+    if not dry_run:
+        out = cmd_out(["lvs", "--noheadings", "--readonly", "-o", "vg_name,lv_name"])
+        for line in out.splitlines():
+            cols = line.strip().split()
+            if len(cols) == 2:
+                vg, lv = cols
+                mapper = lvm_mapper_path(f"/dev/{vg}/{lv}")
+                if mapper in lv_devices or f"/dev/{vg}/{lv}" in lv_devices:
+                    vgs_to_deactivate.add(vg)
+
+    if not vgs_to_deactivate and not dry_run:
+        log.debug("  No matching VGs found to deactivate")
+        return
+
+    for vg in sorted(vgs_to_deactivate):
+        log.info(f"  vgchange -an {vg}")
+        try:
+            run(["vgchange", "-an", vg],
+                dry_run=dry_run, check=False, capture=True)
+        except Exception as e:
+            log.warning(f"  vgchange -an {vg}: {e}")
 
 def lvm_active_lvs() -> list[str]:
     """Return /dev/<vg>/<lv> paths for every currently active LV."""
@@ -491,35 +525,56 @@ def lvm_mount_lvs(mp_base: Path, part_label: str, readonly: bool,
 
 
 # ── dmsetup cleanup ───────────────────────────────────────────────────────────
-def dmsetup_remove_all(dry_run: bool):
+def dmsetup_remove_all(dry_run: bool, lv_devices: list = None):
     """
-    Remove all /dev/mapper entries. Retries up to 3 times for busy entries
-    and logs the actual error message so we can see what's still holding on.
+    Remove ONLY device mapper entries created by this script.
+    Never removes host OS LVM entries (e.g. root volume) — only removes:
+      - kpartx NBD partition maps: nbd0p1, nbd0p2 etc
+      - LVM LVs tracked in state.lvm_volume_groups
     """
     if not shutil.which("dmsetup"):
         return
 
     if dry_run:
-        log.info("  [DRY-RUN] dmsetup remove --force <all entries>")
+        log.info("  [DRY-RUN] dmsetup remove evidence entries only")
         return
+
+    kpartx_pat = re.compile(r"^nbd\d+p\d+$")
+
+    # Build set of mapper names we own
+    lv_mapper_names: set[str] = set()
+    if lv_devices:
+        for dev in lv_devices:
+            if dev.startswith("/dev/mapper/"):
+                lv_mapper_names.add(Path(dev).name)
+            else:
+                try:
+                    lv_mapper_names.add(Path(lvm_mapper_path(dev)).name)
+                except Exception:
+                    pass
 
     for attempt in range(1, 4):
         out = cmd_out(["dmsetup", "ls"])
         if not out:
             return
 
-        entries = [
+        all_entries = [
             cols[0] for line in out.splitlines()
             if (cols := line.split()) and cols[0] != "control"
         ]
 
-        if not entries:
-            log.debug("  No device mapper entries remaining")
+        # Only touch entries we created
+        to_remove = [
+            name for name in all_entries
+            if kpartx_pat.match(name) or name in lv_mapper_names
+        ]
+
+        if not to_remove:
+            log.debug("  No evidence dm entries to remove")
             return
 
-        log.info(f"  dmsetup pass {attempt}/3: {len(entries)} entries → {entries}")
-
-        for name in entries:
+        log.info(f"  dmsetup pass {attempt}/3: removing {to_remove}")
+        for name in to_remove:
             result = subprocess.run(
                 ["dmsetup", "remove", "--force", name],
                 capture_output=True, text=True
@@ -529,22 +584,19 @@ def dmsetup_remove_all(dry_run: bool):
             else:
                 log.warning(f"    Could not remove {name}: {result.stderr.strip()}")
 
-        # Check what survived
         remaining = [
             cols[0] for line in cmd_out(["dmsetup", "ls"]).splitlines()
             if (cols := line.split()) and cols[0] != "control"
+            and (kpartx_pat.match(cols[0]) or cols[0] in lv_mapper_names)
         ]
         if not remaining:
-            log.info("  All device mapper entries removed")
+            log.info("  Evidence dm entries cleared")
             return
-
-        log.warning(f"  {len(remaining)} still present after pass {attempt}: {remaining}")
+        log.warning(f"  {len(remaining)} entries still present: {remaining}")
         if attempt < 3:
             time.sleep(1)
 
-    log.error("  Some /dev/mapper entries could not be removed.")
-    log.error("  Manual cleanup: sudo dmsetup ls | grep -v '^control' | "
-              "awk '{print $1}' | while read n; do sudo dmsetup remove --force \"$n\"; done")
+    log.error("  Some dm entries could not be removed — manual cleanup may be needed")
 
 
 # ── kpartx ────────────────────────────────────────────────────────────────────
@@ -1113,9 +1165,15 @@ def unmount_all(mount_base: Path, dry_run: bool):
             pass
         for mp in sorted(mounts, reverse=True):
             _umount(mp, dry_run)
-        lvm_deactivate(dry_run)
-        dmsetup_remove_all(dry_run)
+        # No state = we don't know what we mounted, so skip LVM/dmsetup cleanup
+        # rather than risk touching the host OS volumes
+        log.warning("No state files — skipping LVM/dmsetup cleanup to protect host OS")
+        log.warning("If evidence LVM volumes remain, deactivate manually:")
+        log.warning("  sudo vgchange -an <vg_name>  &&  sudo dmsetup remove --force <name>")
         return
+
+    # Collect all LVM devices across all state files for targeted cleanup
+    all_lvm_devices: list[str] = []
 
     # ── Per-image teardown ────────────────────────────────────────────────────
     for sf in state_files:
@@ -1123,6 +1181,9 @@ def unmount_all(mount_base: Path, dry_run: bool):
         if not state:
             continue
         log.info(f"\n── Teardown: {state.image_path}")
+
+        # Accumulate LVM devices for final cleanup
+        all_lvm_devices.extend(state.lvm_volume_groups)
 
         # 1. Unmount all filesystem mountpoints (deepest first)
         for mp in sorted(state.partitions, reverse=True):
@@ -1137,9 +1198,6 @@ def unmount_all(mount_base: Path, dry_run: bool):
                 log.info(f"  [DRY-RUN] kpartx -d {dev} && losetup -d {dev}")
 
         # 3. Release NBD devices — kpartx FIRST then disconnect
-        #    kpartx -d must happen before qemu-nbd --disconnect otherwise the
-        #    mapper entries hold the device open and the disconnect either fails
-        #    silently or leaves the last partition entry stuck in /dev/mapper
         for dev in state.nbd_devices:
             if not dry_run:
                 kpartx_remove(dev)
@@ -1159,7 +1217,6 @@ def unmount_all(mount_base: Path, dry_run: bool):
     log.info("\n── Final cleanup")
 
     if not dry_run:
-        # Log exactly what's left in /dev/mapper so we can diagnose stragglers
         mapper_remaining = [
             e.name for e in Path("/dev/mapper").iterdir()
             if e.name != "control"
@@ -1169,8 +1226,9 @@ def unmount_all(mount_base: Path, dry_run: bool):
         else:
             log.info("  /dev/mapper is clean")
 
-    lvm_deactivate(dry_run)
-    dmsetup_remove_all(dry_run)
+    # Only deactivate/remove entries we actually mounted — never touch host OS volumes
+    lvm_deactivate(dry_run, all_lvm_devices)
+    dmsetup_remove_all(dry_run, all_lvm_devices)
 
     log.info("Cleaning empty directories...")
     if not dry_run:
