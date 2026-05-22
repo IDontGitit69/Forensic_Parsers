@@ -205,11 +205,22 @@ def _format_matches(matches) -> list:
 # ---------------------------------------------------------------------------
 
 def collect_files(scan_path: Path) -> list:
-    """Collect all files to scan from a path (file or directory)."""
+    """
+    Collect all files to scan from a path (file or directory).
+    Skips any paths that raise I/O errors during traversal (e.g. corrupt
+    disk images, bad sectors, broken mounts).
+    """
     if scan_path.is_file():
         return [scan_path]
     elif scan_path.is_dir():
-        return [f for f in scan_path.rglob("*") if f.is_file()]
+        files = []
+        for f in scan_path.rglob("*"):
+            try:
+                if f.is_file():
+                    files.append(f)
+            except (OSError, IOError) as exc:
+                log.warning("Skipping unreadable path during collection: %s — %s", f, exc)
+        return files
     else:
         log.error("Scan path '%s' is not a file or directory.", scan_path)
         sys.exit(1)
