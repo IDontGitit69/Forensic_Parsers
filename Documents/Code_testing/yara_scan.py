@@ -122,36 +122,51 @@ def load_rules(rules_path: str) -> yara.Rules:
         sys.exit(1)
 
 
-def scan_bytes(rules: yara.Rules, data: bytes, label: str) -> list:
-    """Scan raw bytes with YARA. Returns a list of match dicts."""
+def scan_bytes(rules: yara.Rules, data: bytes, label: str):
+    """
+    Scan raw bytes with YARA. Returns a list of match dicts on success,
+    or None if the scan could not be completed (corrupt data, I/O error, etc).
+    """
     try:
         matches = rules.match(data=data, timeout=60)
+        return _format_matches(matches)
     except yara.TimeoutError:
         log.warning("  YARA timed out scanning: %s", label)
-        return []
     except yara.Error as exc:
         log.warning("  YARA error scanning %s: %s", label, exc)
-        return []
+    except (IOError, OSError) as exc:
+        log.error("  I/O error scanning %s (corrupt file?): %s", label, exc)
+    except Exception as exc:
+        log.error("  Unexpected error scanning %s: %s", label, exc)
+    return None
 
-    return _format_matches(matches)
 
-
-def scan_path(rules: yara.Rules, file_path: Path) -> list:
-    """Scan a file on disk with YARA (used for plain uncompressed files). Returns a list of match dicts."""
+def scan_path(rules: yara.Rules, file_path: Path):
+    """
+    Scan a file on disk with YARA. Returns a list of match dicts on success,
+    or None if the scan could not be completed (corrupt file, I/O error, etc).
+    """
     try:
         matches = rules.match(str(file_path), timeout=60)
+        return _format_matches(matches)
     except yara.TimeoutError:
         log.warning("  YARA timed out scanning: %s", file_path.name)
-        return []
     except yara.Error as exc:
         log.warning("  YARA error scanning %s: %s", file_path.name, exc)
-        return []
-
-    return _format_matches(matches)
+    except (IOError, OSError) as exc:
+        log.error("  I/O error scanning %s (corrupt file?): %s", file_path.name, exc)
+    except Exception as exc:
+        log.error("  Unexpected error scanning %s: %s", file_path.name, exc)
+    return None
 
 
 def _format_matches(matches) -> list:
-    """Convert yara match objects into serialisable dicts."""
+    """
+    Convert yara match objects into serialisable dicts.
+    Handles both yara-python API styles:
+      - >= 4.3: match.strings is a list of StringMatch objects with .identifier / .instances
+      - <  4.3: match.strings is a list of (offset, identifier, data) tuples
+    """
     results = []
     for match in matches:
         hit = {
@@ -162,16 +177,25 @@ def _format_matches(matches) -> list:
             "matched_strings": [],
         }
         for string in match.strings:
-            hit["matched_strings"].append({
-                "identifier": string.identifier,
-                "instances": [
-                    {
-                        "offset": instance.offset,
-                        "matched_data": instance.matched_data.hex(),
-                    }
-                    for instance in string.instances
-                ],
-            })
+            if isinstance(string, tuple):
+                # Old API: (offset, identifier, data)
+                offset, identifier, data = string
+                hit["matched_strings"].append({
+                    "identifier": identifier,
+                    "instances": [{"offset": offset, "matched_data": data.hex()}],
+                })
+            else:
+                # New API: StringMatch object with .identifier and .instances
+                hit["matched_strings"].append({
+                    "identifier": string.identifier,
+                    "instances": [
+                        {
+                            "offset": instance.offset,
+                            "matched_data": instance.matched_data.hex(),
+                        }
+                        for instance in string.instances
+                    ],
+                })
         results.append(hit)
     return results
 
@@ -204,7 +228,7 @@ def process_file(rules, file_path, scan_results, files_scanned, files_skipped):
     suffix = file_path.suffix.lower()
     stat   = file_path.stat()
 
-    def make_entry(original, label, compressed, ctype, matches):
+    def make_entry(original, label, compressed, ctype, matches, corrupt=False):
         return {
             "original_file":    str(original),
             "scanned_label":    label,
@@ -212,8 +236,9 @@ def process_file(rules, file_path, scan_results, files_scanned, files_skipped):
             "compression_type": ctype,
             "file_size_bytes":  stat.st_size,
             "scan_timestamp":   time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "match_count":      len(matches),
-            "matches":          matches,
+            "corrupt":          corrupt,
+            "match_count":      len(matches) if matches is not None else 0,
+            "matches":          matches if matches is not None else [],
         }
 
     # --- ZIP (in-memory) ---
@@ -230,8 +255,9 @@ def process_file(rules, file_path, scan_results, files_scanned, files_skipped):
 
         for entry_name, data in entries:
             matches = scan_bytes(rules, data, entry_name)
+            corrupt = matches is None
             files_scanned += 1
-            entry = make_entry(file_path, f"{file_path.name}::{entry_name}", True, "zip", matches)
+            entry = make_entry(file_path, f"{file_path.name}::{entry_name}", True, "zip", matches, corrupt)
             entry["zip_entry"] = entry_name
             scan_results.append(entry)
             _log_result(entry_name, matches)
@@ -247,21 +273,25 @@ def process_file(rules, file_path, scan_results, files_scanned, files_skipped):
             return files_scanned, files_skipped + 1
 
         matches = scan_bytes(rules, data, file_path.name)
+        corrupt = matches is None
         files_scanned += 1
-        scan_results.append(make_entry(file_path, file_path.stem, True, "pigz", matches))
+        scan_results.append(make_entry(file_path, file_path.stem, True, "pigz", matches, corrupt))
         _log_result(file_path.name, matches)
         return files_scanned, files_skipped
 
     # --- Plain file (read from disk normally) ---
     matches = scan_path(rules, file_path)
+    corrupt = matches is None
     files_scanned += 1
-    scan_results.append(make_entry(file_path, file_path.name, False, None, matches))
+    scan_results.append(make_entry(file_path, file_path.name, False, None, matches, corrupt))
     _log_result(file_path.name, matches)
     return files_scanned, files_skipped
 
 
 def _log_result(label, matches):
-    if matches:
+    if matches is None:
+        log.error("  [%s] Skipped — could not be scanned (corrupt?).", label)
+    elif matches:
         log.info("  [%s] WARNING %d match(es) found.", label, len(matches))
     else:
         log.info("  [%s] No matches.", label)
@@ -288,7 +318,8 @@ def run_scan(rules_path, scan_path, output_file):
             rules, file_path, scan_results, files_scanned, files_skipped
         )
 
-    total_matches = sum(r["match_count"] for r in scan_results)
+    total_matches  = sum(r["match_count"] for r in scan_results)
+    files_corrupt  = sum(1 for r in scan_results if r.get("corrupt"))
     output = {
         "scan_metadata": {
             "scan_id":        f"yara-scan-{time.strftime('%Y%m%d-%H%M%S')}",
@@ -297,6 +328,7 @@ def run_scan(rules_path, scan_path, output_file):
             "scan_path":      str(scan_path),
             "files_scanned":  files_scanned,
             "files_skipped":  files_skipped,
+            "files_corrupt":  files_corrupt,
             "total_matches":  total_matches,
         },
         "results": scan_results,
@@ -306,8 +338,8 @@ def run_scan(rules_path, scan_path, output_file):
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(output, indent=2), encoding="utf-8")
     log.info("Results written to: %s", out_path)
-    log.info("Summary -- Scanned: %d | Skipped: %d | Total YARA hits: %d",
-             files_scanned, files_skipped, total_matches)
+    log.info("Summary -- Scanned: %d | Skipped: %d | Corrupt: %d | Total YARA hits: %d",
+             files_scanned, files_skipped, files_corrupt, total_matches)
 
 
 # ---------------------------------------------------------------------------
