@@ -204,25 +204,50 @@ def _format_matches(matches) -> list:
 # File collection
 # ---------------------------------------------------------------------------
 
+def _walk_safe(root: Path) -> list:
+    """
+    Recursively walk a directory tree, catching I/O errors at every level
+    so a single bad directory or file (e.g. corrupt VMDK mount, bad sector)
+    never aborts the entire traversal.
+    """
+    files = []
+    try:
+        entries = list(root.iterdir())
+    except (OSError, IOError) as exc:
+        log.warning("Cannot list directory, skipping: %s — %s", root, exc)
+        return files
+
+    for entry in entries:
+        try:
+            if entry.is_symlink():
+                # Skip symlinks to avoid loops and unresolvable targets
+                continue
+            if entry.is_file():
+                files.append(entry)
+            elif entry.is_dir():
+                files.extend(_walk_safe(entry))
+        except (OSError, IOError) as exc:
+            log.warning("Skipping unreadable path: %s — %s", entry, exc)
+
+    return files
+
+
 def collect_files(scan_path: Path) -> list:
     """
     Collect all files to scan from a path (file or directory).
-    Skips any paths that raise I/O errors during traversal (e.g. corrupt
-    disk images, bad sectors, broken mounts).
+    Uses a safe recursive walk that skips unreadable paths rather than
+    crashing on I/O errors from corrupt images or bad mounts.
     """
-    if scan_path.is_file():
-        return [scan_path]
-    elif scan_path.is_dir():
-        files = []
-        for f in scan_path.rglob("*"):
-            try:
-                if f.is_file():
-                    files.append(f)
-            except (OSError, IOError) as exc:
-                log.warning("Skipping unreadable path during collection: %s — %s", f, exc)
-        return files
-    else:
-        log.error("Scan path '%s' is not a file or directory.", scan_path)
+    try:
+        if scan_path.is_file():
+            return [scan_path]
+        elif scan_path.is_dir():
+            return _walk_safe(scan_path)
+        else:
+            log.error("Scan path '%s' is not a file or directory.", scan_path)
+            sys.exit(1)
+    except (OSError, IOError) as exc:
+        log.error("Cannot access scan path '%s': %s", scan_path, exc)
         sys.exit(1)
 
 
