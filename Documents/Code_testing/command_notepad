@@ -28,16 +28,3 @@ sudo dmsetup ls | grep -v "^control" | awk '{print $1}' | while read name; do
     sudo dmsetup remove "$name" 2>/dev/null && echo "Removed: $name"
 done
 
-
-
-Continued development and operational use of an engagement-specific IOC operationalization capability to support large-scale forensic analysis efforts. Leveraged the capability to rapidly perform follow-on analysis across 20+ forensic images simultaneously, enabling efficient identification and review of TA-related PostgreSQL database access activity. Additionally, resolved a network communication issue impacting one of the test servers, restoring the system’s ability to receive updated detection rules. Continued tradecraft development and GPEN preparation efforts, achieving a 91% on a full-length practice exam ahead of the scheduled certification attempt next week.
-
-Engagement Specific IOC Scanning Project:
-
-Continued development and refinement of an engagement-specific IOC operationalization and bulk forensic analysis capability designed to rapidly mount, search, and analyze evidence at scale across multiple forensic images simultaneously.
-Utilized the bulk mounting capability to quickly identify and extract targeted log artifacts across 20+ hosts for analysis of TA activity related to PostgreSQL database access. The capability significantly reduced analysis time and overcame traditional tooling limitations, including drive letter constraints commonly encountered with mounting solutions such as AIM.
-Troubleshot and resolved a network communication issue affecting one of the test servers that prevented outbound connectivity and blocked updated detection rules from being received. Restoration of connectivity allowed the server to successfully synchronize and update to the latest detection rule set.
-
-Tradecraft/Training:
-
-Continued GPEN preparation and completed a full-length practice examination in advance of the scheduled certification attempt next week, achieving a score of 91%.
