@@ -1,0 +1,41 @@
+---
+# .gitlab-ci.yml — production pipeline
+# detection-rules-pipeline
+
+default:
+  image: python:3.11-slim
+
+stages:
+  - fetch
+  - validate
+
+# ── Fetch rules from all sources ─────────────────────────────────────────────
+fetch-rules:
+  stage: fetch
+  script:
+    - pip install -r requirements.txt --quiet
+    - pip install -e . --quiet
+    - python -m pipeline.fetch_mandiant
+    - python -m pipeline.fetch_s3
+  artifacts:
+    when: always
+    paths:
+      - rules/
+    expire_in: 1 day
+
+# ── Validate rule names and compilation ──────────────────────────────────────
+validate-rules:
+  stage: validate
+  variables:
+    REPO_ROOT: "."
+    YARA_BIN: "pipeline/tools/yarac64.exe"
+  script:
+    - pip install -e . --quiet
+    - python -m pipeline.validate
+  artifacts:
+    when: always
+    paths:
+      - rules/
+    expire_in: 1 day
+  dependencies:
+    - fetch-rules
