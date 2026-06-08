@@ -7,8 +7,8 @@ Two checks:
      the same bundle). Renames duplicates by appending _1, _2, _3 etc.
      directly inside the file and saves the change.
 
-  2. Compilation check — runs yarac64.exe -f against each bundle file to
-     ensure it compiles cleanly after deduplication.
+  2. Compilation check — runs yarac64.exe SOURCE_FILE OUTPUT_FILE against
+     each bundle file to ensure it compiles cleanly after deduplication.
 
 Usage:
   python -m pipeline.validate
@@ -19,6 +19,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 logging.basicConfig(
@@ -48,11 +49,6 @@ def extract_rule_names(content: str) -> list[str]:
 
 
 def deduplicate_rule_names(files: list[Path]) -> dict:
-    """
-    Scan all rule files, find duplicate rule names across all bundles,
-    rename duplicates by appending _1, _2 etc. inside the file content,
-    and save the updated files.
-    """
     seen: dict[str, list[tuple[Path, str]]] = {}
 
     for path in files:
@@ -106,7 +102,9 @@ def deduplicate_rule_names(files: list[Path]) -> dict:
 
 def compile_check(files: list[Path]) -> tuple[list[Path], list[Path]] | None:
     """
-    Run yarac64.exe -f against each bundle file.
+    Run yarac64.exe SOURCE_FILE OUTPUT_FILE against each bundle file.
+    yarac requires an output file — we write to a temp file and discard it.
+    We only care about the return code and error output.
     Returns (passed, failed), or None if the binary is not available.
     """
     if not Path(YARA_BIN).exists():
@@ -120,13 +118,18 @@ def compile_check(files: list[Path]) -> tuple[list[Path], list[Path]] | None:
     failed = []
 
     for path in files:
+        tmp_path = None
         try:
+            with tempfile.NamedTemporaryFile(suffix=".yarc", delete=False) as tmp:
+                tmp_path = tmp.name
+
             result = subprocess.run(
-                [YARA_BIN, "-f", str(path)],
+                [YARA_BIN, str(path), tmp_path],
                 capture_output=True,
                 text=True,
                 timeout=30,
             )
+
             if result.returncode == 0:
                 passed.append(path)
             else:
@@ -135,9 +138,18 @@ def compile_check(files: list[Path]) -> tuple[list[Path], list[Path]] | None:
                     f"  {result.stderr.strip() or result.stdout.strip()}"
                 )
                 failed.append(path)
+
         except subprocess.TimeoutExpired:
             logger.error(f"COMPILE TIMEOUT: {path}")
             failed.append(path)
+
+        finally:
+            # Always clean up the temp compiled output
+            if tmp_path:
+                try:
+                    Path(tmp_path).unlink(missing_ok=True)
+                except Exception:
+                    pass
 
     return passed, failed
 
