@@ -1,41 +1,81 @@
 ---
-# .gitlab-ci.yml — production pipeline
+# .gitlab-ci.yml
 # detection-rules-pipeline
+# Currently: fetch stage onlyy
 
 default:
   image: python:3.11-slim
-
 stages:
   - fetch
   - validate
+  - publish
 
-# ── Fetch rules from all sources ─────────────────────────────────────────────
+# ── Fetch rules from all sources and place them in the repo ─────────────────
 fetch-rules:
   stage: fetch
+  tags:
+    - yaralyzer
+  variables:
+    MANDIANT_SOURCE_DIR: "/test-sources/mandiant"
+    S3_SOURCE_DIR: "/test-sources/s3"
+    REPO_ROOT: "."
   script:
+    - echo "Starting fetch stage..."
     - pip install -r requirements.txt --quiet
     - pip install -e . --quiet
-    - python -m pipeline.fetch_mandiant
-    - python -m pipeline.fetch_s3
+    - python -m pipeline.fetch
+    - echo "Fetch complete. Verifying output..."
+    - find Yara Sigma -type f 2>/dev/null || echo "No rule directories found yet"
   artifacts:
     when: always
     paths:
-      - rules/
+      - Yara/
+      - Sigma/
     expire_in: 1 day
+
 
 # ── Validate rule names and compilation ──────────────────────────────────────
 validate-rules:
   stage: validate
+  tags:
+    - yaralyzer
   variables:
     REPO_ROOT: "."
-    YARA_BIN: "pipeline/tools/yarac64.exe"
+    YARA_BIN: "yara"
   script:
+    - apt-get update -qq && apt-get install -y yara
     - pip install -e . --quiet
     - python -m pipeline.validate
   artifacts:
     when: always
     paths:
-      - rules/
+      - Yara/
+      - Sigma/
     expire_in: 1 day
   dependencies:
     - fetch-rules
+# ── Publish validated rules to customer-facing repo ──────────────────────────
+publish-rules:
+  stage: publish
+  tags:
+    - yaralyzer
+  variables:
+    REPO_ROOT: "."
+    RULES_DIR: "Yara"
+    CUSTOMER_REPO_PATH: "alesher/detection-rules-repo"   # update to your actual path
+    CUSTOMER_BRANCH: "main"
+    GIT_BOT_EMAIL: "ci-bot@local"
+    GIT_BOT_NAME: "Pipeline Bot"
+    CUSTOMER_REPO_URL: "http://alesher:${PAT_TOKEN}@host.docker.internal/alesher/detection-rules-repo.git"
+  script:
+    - apt-get update -qq && apt-get install -y git --no-install-recommends
+    - pip install -e . --quiet
+    - python -m pipeline.publish
+  artifacts:
+    when: always
+    paths:
+      - Yara/
+      - Sigma/
+    expire_in: 1 day
+  dependencies:
+    - validate-rules
