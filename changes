@@ -1,0 +1,52 @@
+def post_mr_comment(message: str):
+    """
+    Post a comment on the MR via the GitLab API.
+    Silently skips if any required variable is missing.
+    """
+    if not all([CI_PROJECT_ID, CI_MR_IID, PAT_TOKEN, CI_SERVER_HOST]):
+        logger.warning(
+            "Cannot post MR comment — one or more required CI variables "
+            "are missing (CI_PROJECT_ID, CI_MERGE_REQUEST_IID, "
+            "PAT_TOKEN, CI_SERVER_HOST)."
+        )
+        return
+
+    import ssl
+
+    ssl_cert = os.environ.get("SSL_CERT_FILE_PATH", "")
+
+    url = (
+        f"https://{CI_SERVER_HOST}/api/v4/projects/{CI_PROJECT_ID}"
+        f"/merge_requests/{CI_MR_IID}/notes"
+    )
+
+    data = json.dumps({"body": message}).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "PRIVATE-TOKEN": PAT_TOKEN,
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
+    try:
+        if ssl_cert and Path(ssl_cert).exists():
+            # Use the cert file from CI/CD variable
+            ssl_context = ssl.create_default_context(cafile=ssl_cert)
+            logger.info(f"Using SSL cert: {ssl_cert}")
+        else:
+            # Fall back to default SSL context
+            ssl_context = ssl.create_default_context()
+            if ssl_cert:
+                logger.warning(
+                    f"SSL_CERT_FILE_PATH is set to '{ssl_cert}' "
+                    f"but the file was not found — using default SSL context."
+                )
+
+        urllib.request.urlopen(req, context=ssl_context)
+        logger.info("Posted comment on MR.")
+
+    except Exception as e:
+        logger.warning(f"Could not post MR comment: {e}")
