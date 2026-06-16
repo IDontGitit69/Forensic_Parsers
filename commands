@@ -14,3 +14,47 @@ git sparse-checkout set rules/Yara
 
 # Pull the files
 GIT_SSL_CAINFO="$SSL_CERT" git checkout "$BRANCH"
+
+
+
+
+
+#!/bin/bash
+# sync_rules.sh — pulls latest Yara rules and places them in Thor directory
+
+# ── Config ───────────────────────────────────────────────────────────────────
+GITLAB_HOST="your-gitlab-host"
+REPO_PATH="alesher/detection-rules-repo"
+TOKEN=$(cat /path/to/token/file)
+BRANCH="main"
+SSL_CERT="/path/to/cert.crt"
+CLONE_DIR="/opt/rules-sync"
+THOR_DIR="/mnt/c/x/bin/thor/custom-signatures/yara"
+
+# ── Pull latest rules ────────────────────────────────────────────────────────
+echo "[$(date -u +%Y-%m-%dT%H:%M:%S)] Pulling latest rules..."
+
+cd "$CLONE_DIR" || { echo "ERROR: Clone directory not found. Run setup first."; exit 1; }
+
+GIT_SSL_CAINFO="$SSL_CERT" git pull origin "$BRANCH"
+
+if [ $? -ne 0 ]; then
+    echo "ERROR: git pull failed — aborting. Thor rules unchanged."
+    exit 1
+fi
+
+# ── Sync to Thor directory ───────────────────────────────────────────────────
+echo "[$(date -u +%Y-%m-%dT%H:%M:%S)] Syncing rules to Thor..."
+
+# rsync mirrors rules/Yara/ into Thor directory
+# --delete removes rules from Thor that no longer exist in the repo
+rsync -av --delete \
+    "$CLONE_DIR/rules/Yara/" \
+    "$THOR_DIR/"
+
+if [ $? -ne 0 ]; then
+    echo "ERROR: rsync failed — Thor rules may be incomplete."
+    exit 1
+fi
+
+echo "[$(date -u +%Y-%m-%dT%H:%M:%S)] Sync complete."
