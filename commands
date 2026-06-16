@@ -1,0 +1,16 @@
+# Clone with sparse checkout — no files downloaded yet
+GIT_SSL_CAINFO="$SSL_CERT" git clone \
+  --no-checkout \
+  --depth=1 \
+  --filter=blob:none \
+  --sparse \
+  "https://oauth2:${TOKEN}@${GITLAB_HOST}/${REPO_PATH}.git" \
+  "$CLONE_DIR"
+
+cd "$CLONE_DIR"
+
+# Tell git to only pull rules/Yara/
+git sparse-checkout set rules/Yara
+
+# Pull the files
+GIT_SSL_CAINFO="$SSL_CERT" git checkout "$BRANCH"
