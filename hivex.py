@@ -111,14 +111,33 @@ def main():
             for value_name in ("IPAddress", "DhcpIPAddress"):
                 try:
                     val = h.node_get_value(child, value_name)
-                    val_type = h.value_type(val)[0]
-                    if val_type == hivex.REG_MULTI_SZ:
-                        data = h.value_multiple_strings(val)
-                    else:
-                        data = h.value_string(val)
-                    print(f"    {value_name} = {data}")
                 except RuntimeError:
-                    pass  # this value doesn't exist on this interface, normal
+                    continue  # this value doesn't exist on this interface, normal
+
+                # Don't rely on a specific REG_* constant name (varies by
+                # hivex version/binding) -- just try the readers in order
+                # and use whichever one doesn't raise.
+                data = None
+                try:
+                    data = h.value_multiple_strings(val)
+                except RuntimeError:
+                    pass
+                if data is None:
+                    try:
+                        data = h.value_string(val)
+                    except RuntimeError:
+                        pass
+
+                if data is not None:
+                    print(f"    {value_name} = {data}")
+                else:
+                    # Last resort: show the raw type code so we can see what
+                    # we're actually dealing with if both readers failed.
+                    try:
+                        type_code, _ = h.value_type(val)
+                        print(f"    {value_name} = <could not decode, raw type code {type_code}>")
+                    except RuntimeError as e:
+                        print(f"    {value_name} = <could not read at all: {e}>")
 
 
 if __name__ == "__main__":
